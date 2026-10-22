@@ -8,3 +8,8 @@ filehash = true
 [serve]
 addresses = ["127.0.0.1"]
 port = 8771
+
+# Pinned tool versions (packaging/web/toolchain.lock holds their sha256; repro-build.sh verifies).
+[tools]
+wasm_bindgen = "0.2.129"
+wasm_opt = "version_131"

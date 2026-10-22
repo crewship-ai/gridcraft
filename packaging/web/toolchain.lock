@@ -1,0 +1,20 @@
+# Pinned web build toolchain. Sourced by packaging/web/fetch-tools.sh and repro-build.sh.
+# rustc is pinned by rust-toolchain.toml; the build refuses any other compiler.
+RUSTC_VERSION="rustc 1.99.1 (58cf8f9c3 2026-10-13)"
+RUSTC_COMMIT_HASH="58cf8f9c35b355199727627d07ae34a4e2846d67"
+
+TRUNK_VERSION="0.22.0"
+TRUNK_URL="https://github.com/trunk-rs/trunk/releases/download/v0.22.0/trunk-x86_64-unknown-linux-gnu.tar.gz"
+TRUNK_TARBALL_SHA256="f78c1989240c56592d8cfc4df5cc27399a3ff66a3f9cc819e16f1e3d809ce7c2"
+TRUNK_BIN_SHA256="d848876d2a47e6b3a7e25877e0206276252003e19bc1edcc2f77968d1a8c671f"
+
+# Must equal the wasm-bindgen version in Cargo.lock.
+WASM_BINDGEN_VERSION="0.2.129"
+WASM_BINDGEN_URL="https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.129/wasm-bindgen-0.2.129-x86_64-unknown-linux-musl.tar.gz"
+WASM_BINDGEN_TARBALL_SHA256="82d12bb940e2d4e72e0d5605387fc1b8ca179044e012b620f0ce4e7440e8320e"
+WASM_BINDGEN_BIN_SHA256="fb59da714982a04273e9e4b09a85e523e5dd04de35b1a4a8b1641785ee7a71cf"
+
+WASM_OPT_VERSION="version_131"
+WASM_OPT_URL="https://github.com/WebAssembly/binaryen/releases/download/version_131/binaryen-version_131-x86_64-linux.tar.gz"
+WASM_OPT_TARBALL_SHA256="b5bf1f0eaf17c63ee588ff7a5954dc8f6ce2c26989051c66f24dfe9ece3e46db"
+WASM_OPT_BIN_SHA256="bad4b6524b2c8e4b27b9aa69bde1a4b9a05ec8887c77ef0d34300f5825acd97c"
