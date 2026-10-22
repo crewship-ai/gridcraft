@@ -7,7 +7,9 @@
 #   env SOURCE_DATE_EPOCH    defaults to the HEAD commit time
 #
 # Output (all deterministic, nothing depends on the checkout path, user, clock or locale):
-#   <out_dir>/site/                       trunk output (index.html, *.js, *_bg.wasm, icon)
+#   <out_dir>/site/                       trunk output (index.html, *.js, *_bg.wasm, icon) with the
+#                                         inline bootstrap/style moved to files (externalize.py)
+#   <out_dir>/csp.txt                     the Content-Security-Policy the page works under
 #   <out_dir>/gridcraft-web-<rev>.tar     the site as a normalized tar (sorted, mtime=SDE, uid 0)
 #   <out_dir>/build-info.json             commit, SOURCE_DATE_EPOCH, toolchain versions
 #   <out_dir>/MANIFEST.sha256             sha256 of every file above (sha256sum format)
@@ -71,6 +73,8 @@ export TRUNK_TOOLS_WASM_BINDGEN="$WASM_BINDGEN_VERSION" TRUNK_TOOLS_WASM_OPT="$W
 
 # --- normalize and digest -----------------------------------------------------------------------
 rm -f "$OUT/site/.trunk-lock"   # trunk's (empty) build lock, not part of the site
+# No inline script or style (strict CSP, sandboxed frames); bundle digests into a <meta>.
+python3 "$HERE/externalize.py" "$OUT/site" "$OUT/csp.txt"
 find "$OUT/site" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
 TAR="gridcraft-web-${REV:0:12}.tar"
 (cd "$OUT" && find site -print0 | sort -z |
@@ -91,7 +95,7 @@ cat > "$OUT/build-info.json" <<JSON
   "tar": "$TAR"
 }
 JSON
-touch -d "@$SOURCE_DATE_EPOCH" "$OUT/build-info.json" "$OUT/$TAR"
+touch -d "@$SOURCE_DATE_EPOCH" "$OUT/build-info.json" "$OUT/csp.txt" "$OUT/$TAR"
 
-(cd "$OUT" && find site "$TAR" build-info.json -type f -print0 | sort -z | xargs -0 sha256sum > MANIFEST.sha256)
+(cd "$OUT" && find site "$TAR" build-info.json csp.txt -type f -print0 | sort -z | xargs -0 sha256sum > MANIFEST.sha256)
 cat "$OUT/MANIFEST.sha256"
