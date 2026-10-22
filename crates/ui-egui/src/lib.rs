@@ -249,6 +249,10 @@ pub struct SheetApp {
     print_feedback_seen: Option<printing::Feedback>,
     /// Synthetic input from agents, one batch per frame (drags need several frames).
     pub synthetic: std::collections::VecDeque<Vec<egui::Event>>,
+    /// Input events held back for later frames: those that arrived in the same frame after a key
+    /// that opened the cell editor (the editor only takes keys once it exists). See
+    /// [`SheetApp::raw_input_hook`].
+    pub(crate) carried_events: Vec<egui::Event>,
     pub control_rx: Option<std::sync::mpsc::Receiver<ControlRequest>>,
     pub grid: grid::GridState,
     pub perf: Perf,
@@ -305,6 +309,7 @@ impl SheetApp {
             printing: Default::default(),
             print_feedback_seen: None,
             synthetic: Default::default(),
+            carried_events: Vec::new(),
             control_rx: None,
             grid: grid::GridState {
                 last_border: "bottom".into(),
@@ -1126,11 +1131,29 @@ impl SheetApp {
         if let Some(mut batch) = self.synthetic.pop_front() {
             raw.events.append(&mut batch);
         }
+        // Held-back keystrokes go first, in the order they were typed, and the frame ends after
+        // the first key that commits or leaves the editor: what follows it belongs to the next
+        // cell, so it waits another frame (keys typed meanwhile queue behind it).
+        if !self.carried_events.is_empty() {
+            let mut queue = std::mem::take(&mut self.carried_events);
+            queue.append(&mut raw.events);
+            let cut = queue.iter().position(ends_edit_frame).map_or(queue.len(), |i| i + 1);
+            self.carried_events = queue.split_off(cut);
+            raw.events = queue;
+        }
+    }
+
+    /// Whether input is still held back for coming frames (the host should keep repainting).
+    pub fn has_carried_input(&self) -> bool {
+        !self.carried_events.is_empty()
     }
 
     /// Lays out the whole window.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        if self.has_carried_input() {
+            ctx.request_repaint();
+        }
         self.poll_printing(&ctx);
         if !self.fonts_ready || self.fonts_rebind {
             ctx.request_repaint();
@@ -1302,4 +1325,31 @@ pub fn now_ms() -> f64 {
 
 pub fn cell(r: u32, c: u32) -> CellRef {
     CellRef::new(r, c)
+}
+
+/// A key press after which held-back input waits for the next frame: one that commits, cancels
+/// or moves out of a cell edit, or a shortcut.
+fn ends_edit_frame(e: &egui::Event) -> bool {
+    use egui::Key;
+    match e {
+        egui::Event::Key { key, pressed: true, modifiers: m, .. } => {
+            m.ctrl
+                || m.command
+                || m.alt
+                || matches!(
+                    key,
+                    Key::Enter
+                        | Key::Tab
+                        | Key::Escape
+                        | Key::F2
+                        | Key::ArrowUp
+                        | Key::ArrowDown
+                        | Key::ArrowLeft
+                        | Key::ArrowRight
+                        | Key::PageUp
+                        | Key::PageDown
+                )
+        }
+        _ => false,
+    }
 }

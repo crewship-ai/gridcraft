@@ -2622,7 +2622,25 @@ fn keyboard(app: &mut SheetApp, ctx: &egui::Context, resp: &egui::Response, geo:
             if !m.alt && (m.ctrl || m.command || (m.shift && *key == egui::Key::Space)))
     });
     let page = ((geo.cells.height() / geo.z) / sh.default_row_height).floor().max(1.0) as i64;
-    for ev in events {
+    // When a key opens the cell editor, the keys after it in this frame are the editor's: hold
+    // them for the next frame, when the editor has focus (a slow frame can carry a whole word).
+    let carry_rest = |app: &mut SheetApp, i: usize| {
+        let rest: Vec<egui::Event> = events.iter().skip(i + 1).cloned().collect();
+        if !rest.is_empty() {
+            // Not seen by anything else this frame (only if nobody consumed them meanwhile).
+            ctx.input_mut(|inp| {
+                if inp.events.ends_with(&rest) {
+                    inp.events.truncate(inp.events.len() - rest.len());
+                }
+            });
+            let mut held = rest;
+            held.append(&mut app.carried_events);
+            app.carried_events = held;
+            ctx.request_repaint();
+        }
+    };
+    for (i, ev) in events.iter().cloned().enumerate() {
+        let was_editing = app.editor.is_some();
         match ev {
             egui::Event::Copy => {
                 app.copy_to_clipboard(ctx, "edit.copy");
@@ -2637,6 +2655,7 @@ fn keyboard(app: &mut SheetApp, ctx: &egui::Context, resp: &egui::Response, geo:
                 if let Some(ed) = app.editor.as_mut() {
                     ed.caret = ed.text.chars().count();
                 }
+                carry_rest(app, i);
                 return;
             }
             egui::Event::Key { key, physical_key, pressed: true, modifiers: m, .. } => {
@@ -2717,6 +2736,10 @@ fn keyboard(app: &mut SheetApp, ctx: &egui::Context, resp: &egui::Response, geo:
                 }
             }
             _ => {}
+        }
+        if !was_editing && app.editor.is_some() {
+            carry_rest(app, i);
+            return;
         }
     }
 }
