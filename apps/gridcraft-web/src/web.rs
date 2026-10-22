@@ -29,7 +29,7 @@ pub fn start() {
         // workbooks in it and stores what it saves (`host`).
         let bridge = if query_param("host").as_deref() == Some("parent") { crate::host::Bridge::new() } else { None };
         let app_bridge = bridge.clone();
-        // `?host=authority&parent_origin=<origin>&client=<id>`: a (possibly cross-origin)
+        // `?host=authority&parent_origin=<origin>`: a (possibly cross-origin, sandboxed)
         // host owns the document; see `authority`.
         let authority_mode = query_param("host").as_deref() == Some("authority");
         let result = eframe::WebRunner::new()
@@ -290,7 +290,6 @@ fn mime_for(name: &str) -> &'static str {
 }
 
 /// Trigger a browser save dialog or download of `bytes` named after `name`.
-
 fn download(name: &str, bytes: &[u8]) -> Result<(), String> {
     let js = |e: wasm_bindgen::JsValue| format!("{e:?}");
     let window = web_sys::window().ok_or("no window")?;

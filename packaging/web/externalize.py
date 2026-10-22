@@ -6,8 +6,6 @@ Usage: externalize.py <site_dir> <csp_out>
 - Moves trunk's inline module bootstrap (`<script type="module">…</script>`) into
   `gridcraft-boot-<hash>.js` and the inline `<style>` into `gridcraft-<hash>.css`, referenced with
   SRI (sha384) like trunk's own links. The page then needs no 'unsafe-inline' and no hashes.
-- Adds `<meta name="gridcraft-bundle" content="wasm=sha256:<hex> js=sha256:<hex>">`: the digests
-  of the wasm and its JS glue, which the editor reports in its host handshake.
 - Refuses any remaining inline script, style element, style attribute or event handler.
 - Writes the matching Content-Security-Policy (one line) to <csp_out>.
 
@@ -53,16 +51,6 @@ def main() -> int:
         "css",
         lambda n, i: f'<link rel="stylesheet" href="./{n}" integrity="{i}" crossorigin="anonymous">',
     )
-
-    wasm = sorted(site.glob("*_bg.wasm"))
-    glue = [p for p in sorted(site.glob("gridcraft-web-*.js"))]
-    if len(wasm) != 1 or len(glue) != 1:
-        sys.exit(f"externalize: expected one wasm and one glue js, found {wasm} {glue}")
-    digest = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()  # noqa: E731
-    meta = f'<meta name="gridcraft-bundle" content="wasm=sha256:{digest(wasm[0])} js=sha256:{digest(glue[0])}">'
-    html, n = re.subn(r'(<meta charset="utf-8">)', r"\1\n  " + meta, html, count=1)
-    if n != 1:
-        sys.exit("externalize: no <meta charset> to anchor the bundle meta")
 
     leftovers = [
         (r"<script(?![^>]*\ssrc=)[^>]*>", "inline <script>"),
