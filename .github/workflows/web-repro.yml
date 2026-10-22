@@ -1,0 +1,117 @@
+# Reproducible web bundle (DRAFT for the fork, not enabled upstream).
+#
+# Builds the browser bundle twice, on two runners, from checkouts in two different directories,
+# with the pinned toolchain (rust-toolchain.toml + packaging/web/toolchain.lock), then requires the
+# two digest manifests to be byte-identical and publishes the manifest and the bundle tar.
+# The manifest (MANIFEST.sha256) is what a host allowlists (bundle digest), not the CI run.
+name: Web reproducible build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "rust-toolchain.toml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "apps/gridcraft-web/**"
+      - "crates/**"
+      - "packaging/web/**"
+      - ".github/workflows/web-repro.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: web-repro-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build (${{ matrix.slot }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Different checkout paths and target dirs: the output must not depend on them.
+          - slot: a
+            src: src
+            target: target-a
+          - slot: b
+            src: deeper/second/checkout
+            target: elsewhere/target-b
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: ${{ matrix.src }}
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        working-directory: ${{ matrix.src }}
+        run: |
+          rustup toolchain install
+          rustc -vV
+
+      - name: Fetch and verify trunk, wasm-bindgen, wasm-opt
+        run: ${{ matrix.src }}/packaging/web/fetch-tools.sh "$RUNNER_TEMP/web-tools"
+
+      - name: Reproducible build
+        env:
+          GRIDCRAFT_WEB_TOOLS: ${{ runner.temp }}/web-tools
+        run: |
+          export CARGO_TARGET_DIR="$GITHUB_WORKSPACE/${{ matrix.target }}"
+          ${{ matrix.src }}/packaging/web/repro-build.sh "$RUNNER_TEMP/out"
+          jq -e '.dirty == false' "$RUNNER_TEMP/out/build-info.json"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: web-bundle-${{ matrix.slot }}
+          path: |
+            ${{ runner.temp }}/out/MANIFEST.sha256
+            ${{ runner.temp }}/out/build-info.json
+            ${{ runner.temp }}/out/gridcraft-web-*.tar
+          if-no-files-found: error
+          retention-days: 30
+
+  compare:
+    name: manifests identical
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: web-bundle-*
+          path: bundles
+
+      - name: Compare manifests and verify the tars
+        run: |
+          set -euo pipefail
+          diff -u bundles/web-bundle-a/MANIFEST.sha256 bundles/web-bundle-b/MANIFEST.sha256
+          for s in a b; do
+            (cd "bundles/web-bundle-$s" &&
+              grep -E ' (gridcraft-web-[0-9a-f]+\.tar|build-info\.json)$' MANIFEST.sha256 | sha256sum -c -)
+          done
+          {
+            echo '### Web bundle digests (reproduced on 2 runners)'
+            echo '```'
+            cat bundles/web-bundle-a/MANIFEST.sha256
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: web-bundle-manifest
+          path: |
+            bundles/web-bundle-a/MANIFEST.sha256
+            bundles/web-bundle-a/build-info.json
+            bundles/web-bundle-a/gridcraft-web-*.tar
+          if-no-files-found: error
+          retention-days: 90
