@@ -1,14 +1,16 @@
-# Reproducible web bundle (DRAFT for the fork, not enabled upstream).
+# Reproducible web bundle.
 #
-# Builds the browser bundle twice, on two runners, from checkouts in two different directories,
-# with the pinned toolchain (rust-toolchain.toml + packaging/web/toolchain.lock), then requires the
-# two digest manifests to be byte-identical and publishes the manifest and the bundle tar.
-# The manifest (MANIFEST.sha256) is what a host allowlists (bundle digest), not the CI run.
+# Builds the browser bundle twice, on two fresh runners, from checkouts in two different
+# directories with different target dirs and cargo homes, with the pinned toolchain
+# (rust-toolchain.toml + packaging/web/toolchain.lock). Both builds must produce byte-identical
+# digest manifests; the bundle manifest (manifest.json) is then checked against its strict format
+# and published with the bundle. The bundle digest (sha256 of manifest.json's exact bytes) is what
+# a host pins and serves at /b/<digest>/; it is written to the job summary.
 name: Web reproducible build
 
 on:
   push:
-    branches: [main]
+    branches: [main, "crewship/**"]
     tags: ["v*"]
   pull_request:
     paths:
@@ -37,13 +39,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Different checkout paths and target dirs: the output must not depend on them.
+          # Different checkout paths, target dirs and cargo homes: the output must not depend on them.
           - slot: a
             src: src
             target: target-a
+            cargo_home: ""
           - slot: b
             src: deeper/second/checkout
             target: elsewhere/target-b
+            cargo_home: cargo-home-b
     env:
       CARGO_TERM_COLOR: never
       CARGO_INCREMENTAL: "0"
@@ -65,53 +69,76 @@ jobs:
       - name: Reproducible build
         env:
           GRIDCRAFT_WEB_TOOLS: ${{ runner.temp }}/web-tools
+          SLOT_CARGO_HOME: ${{ matrix.cargo_home }}
         run: |
+          set -euo pipefail
           export CARGO_TARGET_DIR="$GITHUB_WORKSPACE/${{ matrix.target }}"
+          if [ -n "$SLOT_CARGO_HOME" ]; then export CARGO_HOME="$RUNNER_TEMP/$SLOT_CARGO_HOME"; fi
           ${{ matrix.src }}/packaging/web/repro-build.sh "$RUNNER_TEMP/out"
           jq -e '.dirty == false' "$RUNNER_TEMP/out/build-info.json"
+          echo "build ${{ matrix.slot }}: bundle digest \`$(cat "$RUNNER_TEMP/out/bundle-digest.txt")\`" >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: web-bundle-${{ matrix.slot }}
-          path: |
-            ${{ runner.temp }}/out/MANIFEST.sha256
-            ${{ runner.temp }}/out/build-info.json
-            ${{ runner.temp }}/out/gridcraft-web-*.tar
+          name: web-build-${{ matrix.slot }}
+          path: ${{ runner.temp }}/out
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 14
 
   compare:
-    name: manifests identical
+    name: identical builds, strict manifest
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: src
+          persist-credentials: false
+          sparse-checkout: packaging/web
+
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: web-bundle-*
-          path: bundles
+          pattern: web-build-*
+          path: builds
 
-      - name: Compare manifests and verify the tars
+      - name: Compare the two builds and check the manifest
+        id: digest
         run: |
           set -euo pipefail
-          diff -u bundles/web-bundle-a/MANIFEST.sha256 bundles/web-bundle-b/MANIFEST.sha256
-          for s in a b; do
-            (cd "bundles/web-bundle-$s" &&
-              grep -E ' (gridcraft-web-[0-9a-f]+\.tar|build-info\.json)$' MANIFEST.sha256 | sha256sum -c -)
-          done
+          a=builds/web-build-a b=builds/web-build-b
+          # Byte-identical: the digest list of every output file, and the bundle manifest itself.
+          diff -u "$a/MANIFEST.sha256" "$b/MANIFEST.sha256"
+          cmp "$a/manifest.json" "$b/manifest.json"
+          for s in "$a" "$b"; do (cd "$s" && sha256sum -c --quiet MANIFEST.sha256); done
+          digest="$(sha256sum "$a/manifest.json" | cut -d' ' -f1)"
+          [ "$digest" = "$(cat "$a/bundle-digest.txt")" ] && [ "$digest" = "$(cat "$b/bundle-digest.txt")" ]
+          cmp "$a/manifest.json" "$a/bundle/$digest/manifest.json"
+          # Strict format (exact keys, clean paths, lowercase digests), every file, no extras.
+          python3 src/packaging/web/bundle-manifest.py check "$a/bundle/$digest" "$digest"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
           {
-            echo '### Web bundle digests (reproduced on 2 runners)'
+            echo "### Web bundle (reproduced on 2 runners)"
+            echo
+            echo "Bundle digest (sha256 of \`manifest.json\`): \`$digest\`"
+            echo
+            echo "Source commit: \`$(jq -r .source_commit "$a/manifest.json")\`"
+            echo
+            echo '```json'
+            cat "$a/manifest.json"
             echo '```'
-            cat bundles/web-bundle-a/MANIFEST.sha256
+            echo
+            echo '<details><summary>MANIFEST.sha256 (identical in both builds)</summary>'
+            echo
             echo '```'
+            cat "$a/MANIFEST.sha256"
+            echo '```'
+            echo '</details>'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: web-bundle-manifest
-          path: |
-            bundles/web-bundle-a/MANIFEST.sha256
-            bundles/web-bundle-a/build-info.json
-            bundles/web-bundle-a/gridcraft-web-*.tar
+          name: gridcraft-web-bundle-${{ steps.digest.outputs.digest }}
+          path: builds/web-build-a
           if-no-files-found: error
           retention-days: 90

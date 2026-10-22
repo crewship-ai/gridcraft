@@ -7,12 +7,18 @@
 #   env SOURCE_DATE_EPOCH    defaults to the HEAD commit time
 #
 # Output (all deterministic, nothing depends on the checkout path, user, clock or locale):
-#   <out_dir>/site/                       trunk output (index.html, *.js, *_bg.wasm, icon) with the
-#                                         inline bootstrap/style moved to files (externalize.py)
+#   <out_dir>/manifest.json               bundle manifest: {files:{path:sha256}, source_commit,
+#                                         toolchain}, strict format (bundle-manifest.py)
+#   <out_dir>/bundle-digest.txt           sha256 of manifest.json's exact bytes = the bundle digest
+#   <out_dir>/bundle/<digest>/            the served bundle: trunk output (index.html, *.js,
+#                                         *_bg.wasm, icon) with the inline bootstrap/style moved
+#                                         to files (externalize.py), plus manifest.json
 #   <out_dir>/csp.txt                     the Content-Security-Policy the page works under
-#   <out_dir>/gridcraft-web-<rev>.tar     the site as a normalized tar (sorted, mtime=SDE, uid 0)
-#   <out_dir>/build-info.json             commit, SOURCE_DATE_EPOCH, toolchain versions
+#   <out_dir>/gridcraft-web-bundle.tar    bundle/<digest>/ as a normalized tar (sorted, mtime=SDE, uid 0)
+#   <out_dir>/build-info.json             commit, SOURCE_DATE_EPOCH, bundle digest, toolchain versions
 #   <out_dir>/MANIFEST.sha256             sha256 of every file above (sha256sum format)
+#
+# A host serves the bundle at /b/<digest>/ and pins it by that digest; the manifest pins every file.
 #
 # Network: only `cargo fetch --locked`. trunk runs --offline --locked; cargo runs offline.
 # Two builds of the same commit in different directories must produce an identical
@@ -71,21 +77,33 @@ export TRUNK_TOOLS_WASM_BINDGEN="$WASM_BINDGEN_VERSION" TRUNK_TOOLS_WASM_OPT="$W
 (cd "$ROOT/apps/gridcraft-web" &&
   trunk build --offline --release --locked --dist "$OUT/site" --public-url ./ --filehash true)
 
-# --- normalize and digest -----------------------------------------------------------------------
+# --- normalize, manifest, digest ---------------------------------------------------------------
 rm -f "$OUT/site/.trunk-lock"   # trunk's (empty) build lock, not part of the site
-# No inline script or style (strict CSP, sandboxed frames); bundle digests into a <meta>.
+# No inline script or style (strict CSP, sandboxed frames).
 python3 "$HERE/externalize.py" "$OUT/site" "$OUT/csp.txt"
-find "$OUT/site" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
-TAR="gridcraft-web-${REV:0:12}.tar"
-(cd "$OUT" && find site -print0 | sort -z |
+# The bundle manifest pins every served file; the bundle is addressed by the sha256 of its bytes.
+TOOLCHAIN_JSON="$(printf '{"rustc":"%s","rustc_commit":"%s","target":"wasm32-unknown-unknown","cargo_profile":"release","trunk":"%s","wasm_bindgen":"%s","wasm_opt":"%s"}' \
+  "$RUSTC_VERSION" "$RUSTC_COMMIT_HASH" "$TRUNK_VERSION" "$WASM_BINDGEN_VERSION" "$WASM_OPT_VERSION")"
+DIGEST="$(python3 "$HERE/bundle-manifest.py" write "$OUT/site" "$REV" "$TOOLCHAIN_JSON" "$OUT/manifest.json")"
+mkdir -p "$OUT/bundle"
+mv "$OUT/site" "$OUT/bundle/$DIGEST"
+cp "$OUT/manifest.json" "$OUT/bundle/$DIGEST/manifest.json"
+python3 "$HERE/bundle-manifest.py" check "$OUT/bundle/$DIGEST" "$DIGEST" >/dev/null
+printf '%s\n' "$DIGEST" > "$OUT/bundle-digest.txt"
+find "$OUT/bundle" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
+# The served layout (<digest>/manifest.json + files) as a normalized tar: extract into the
+# host's bundle directory as is.
+TAR="gridcraft-web-bundle.tar"
+(cd "$OUT/bundle" && find "$DIGEST" -print0 | sort -z |
   tar --null --no-recursion -T - --format=gnu --mtime="@$SOURCE_DATE_EPOCH" \
-      --owner=0 --group=0 --numeric-owner --mode='u+rwX,go+rX,go-w' -cf "$TAR")
+      --owner=0 --group=0 --numeric-owner --mode='u+rwX,go+rX,go-w' -cf "$OUT/$TAR")
 
 cat > "$OUT/build-info.json" <<JSON
 {
   "commit": "$REV",
   "dirty": $DIRTY,
   "source_date_epoch": $SOURCE_DATE_EPOCH,
+  "bundle_digest": "$DIGEST",
   "rustc": "$RUSTC_VERSION",
   "target": "wasm32-unknown-unknown",
   "trunk": "$TRUNK_VERSION",
@@ -95,7 +113,9 @@ cat > "$OUT/build-info.json" <<JSON
   "tar": "$TAR"
 }
 JSON
-touch -d "@$SOURCE_DATE_EPOCH" "$OUT/build-info.json" "$OUT/csp.txt" "$OUT/$TAR"
+touch -d "@$SOURCE_DATE_EPOCH" "$OUT/build-info.json" "$OUT/manifest.json" "$OUT/bundle-digest.txt" "$OUT/csp.txt" "$OUT/$TAR"
 
-(cd "$OUT" && find site "$TAR" build-info.json csp.txt -type f -print0 | sort -z | xargs -0 sha256sum > MANIFEST.sha256)
+(cd "$OUT" && find bundle manifest.json bundle-digest.txt "$TAR" build-info.json csp.txt -type f -print0 | sort -z |
+  xargs -0 sha256sum > MANIFEST.sha256)
 cat "$OUT/MANIFEST.sha256"
+echo "bundle digest: $DIGEST"
