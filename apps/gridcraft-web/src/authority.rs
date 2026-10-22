@@ -18,8 +18,8 @@
 //!   commit durable). A rejection reverts the optimistic local change to the host's value and
 //!   keeps the lost input visible as "Not saved".
 //! - Remote commits are applied through the engine without touching the cell editor, the
-//!   selection or the undo/redo stacks; the history snapshots are rebased onto the remote change
-//!   so a local Undo can't revert someone else's commit.
+//!   selection or the undo/redo stacks (`Session::apply_remote`): undo/redo replay remote ops
+//!   onto restored snapshots, so a local Undo can't revert someone else's commit.
 //!
 //! Limits: sheet 0 only, cell inputs only (no styles, structure, sheets), history rebasing
 //! by replaying the op on every snapshot (O(history) recalcs per remote op).
@@ -30,6 +30,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gridcraft_engine::model::Workbook;
+use gridcraft_engine::remote::RemoteOp;
 use gridcraft_engine::{DocState, Session};
 use gridcraft_ui_egui::SheetApp;
 use serde_json::{Value as Json, json};
@@ -253,7 +254,7 @@ impl Authority {
                     }
                 }
                 self.confirmed_rev = rev;
-                apply_remote(app, &to_apply);
+                apply_remote(app, rev, &to_apply);
                 self.synced = app.session.active().map(|d| d.wb.clone());
             }
             "ack" => {
@@ -287,7 +288,7 @@ impl Authority {
                     .filter(|o| !still_pending.contains(&o.cell))
                     .map(|o| Op { cell: o.cell.clone(), input: self.confirmed.get(&o.cell).cloned().unwrap_or_default() })
                     .collect();
-                apply_remote(app, &revert);
+                apply_remote(app, self.confirmed_rev, &revert);
                 self.synced = app.session.active().map(|d| d.wb.clone());
                 let lost: Vec<String> = p.ops.iter().map(|o| format!("{} = \"{}\"", o.cell, o.input)).collect();
                 self.rejected = Some(format!("{code}: {}", lost.join(", ")));
@@ -364,14 +365,14 @@ impl Authority {
             Status::Offline => (format!("Offline · not saved ({} pending)", self.pending.len()), egui::Color32::from_rgb(0xb2, 0x6b, 0x00)),
             Status::NotSaved(why) => (format!("Not saved · {why}"), egui::Color32::from_rgb(0xc0, 0x1c, 0x1c)),
         };
-        egui::Area::new(egui::Id::new("host_authority_status"))
-            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-8.0, -30.0))
-            .interactable(false)
-            .show(ctx, |ui| {
+        egui::Area::new(egui::Id::new("host_authority_status")).anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-8.0, -30.0)).interactable(false).show(
+            ctx,
+            |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.add(egui::Label::new(egui::RichText::new(text).color(color)).wrap_mode(egui::TextWrapMode::Extend));
                 });
-            });
+            },
+        );
     }
 
     /// Test-only state report (`&debug=1`) so a headless test can assert what is on screen.
@@ -450,42 +451,18 @@ fn diff_inputs(old: &Workbook, new: &Workbook) -> Vec<Op> {
         .collect()
 }
 
-/// Apply host-committed ops to the open document without touching the cell editor, the selection
-/// or the history: the undo/redo snapshots are rebased onto the change, so undoing a local edit
-/// later doesn't revert it.
-fn apply_remote(app: &mut SheetApp, ops: &[Op]) {
+/// Apply host-committed ops (or a reconcile to the host's values) through the engine's remote
+/// path: no undo step, redo kept, no journal, selection and the open cell editor untouched; a
+/// later local undo replays them instead of reverting them.
+fn apply_remote(app: &mut SheetApp, rev: u64, ops: &[Op]) {
     if ops.is_empty() {
         return;
     }
-    let Some(d) = app.session.active_mut() else { return };
-    let undo = std::mem::take(&mut d.undo);
-    let redo = std::mem::take(&mut d.redo);
-    let selection = d.selection.clone();
-    let journal = app.session.journal.len();
-    for op in ops {
-        if let Err(e) = app.session.execute_headless("cell.set", json!({"sheet": SHEET, "cell": op.cell, "input": op.input})) {
-            log::error!("remote {} = {:?}: {e}", op.cell, op.input);
-        }
+    let Some(sheet) = app.session.active().and_then(|d| d.wb.sheets.get(SHEET)).map(|s| s.name.clone()) else { return };
+    let ops: Vec<RemoteOp> =
+        ops.iter().filter_map(|o| RemoteOp::set(&sheet, &o.cell, &o.input).map_err(|e| log::error!("remote {}: {e}", o.cell)).ok()).collect();
+    if let Err(e) = app.session.apply_remote(rev, &ops) {
+        log::error!("remote ops at rev {rev}: {e}");
     }
-    app.session.journal.truncate(journal);
-    let Some(d) = app.session.active_mut() else { return };
-    d.undo = undo.into_iter().map(|mut h| {
-        h.wb = rebase(&h.wb, ops);
-        h
-    }).collect();
-    d.redo = redo.into_iter().map(|mut h| {
-        h.wb = rebase(&h.wb, ops);
-        h
-    }).collect();
-    d.selection = selection;
     app.after_engine();
-}
-
-fn rebase(wb: &Arc<Workbook>, ops: &[Op]) -> Arc<Workbook> {
-    let mut tmp = Session::new();
-    tmp.add_document(DocState::new((**wb).clone(), None, String::new()));
-    for op in ops {
-        let _ = tmp.execute_headless("cell.set", json!({"sheet": SHEET, "cell": op.cell, "input": op.input}));
-    }
-    tmp.active().map(|d| d.wb.clone()).unwrap_or_else(|| wb.clone())
 }

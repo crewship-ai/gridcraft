@@ -610,17 +610,23 @@ fn undo(s: &mut Session, p: &Json) -> Result<Json> {
     let d = s.doc_mut()?;
     let mut label = String::new();
     let now = d.wb.clone();
+    // Remote sequence of the state in `d.wb`: current, then each restored snapshot's.
+    let mut seq = d.remote.seq;
     for _ in 0..steps {
         let Some(e) = d.undo.pop() else { break };
         // Redo goes back to the undone edit's cells, not wherever the user clicked before undoing (#1855).
-        let cur = crate::HistoryEntry { label: e.label.clone(), wb: d.wb.clone(), selection: e.selection.clone() };
+        let cur = crate::HistoryEntry { label: e.label.clone(), wb: d.wb.clone(), selection: e.selection.clone(), remote_seq: seq };
         d.redo.push(cur);
         label = e.label.clone();
         d.wb = e.wb;
         d.selection = e.selection;
+        seq = e.remote_seq;
     }
     super::extra::keep_watch_list(&now, &mut d.wb);
     d.calc.rebuild(&d.wb);
+    // Remote ops are not local history: put back those the snapshot predates.
+    d.replay_remote_since(seq);
+    d.prune_remote_log();
     d.revision += 1;
     Ok(json!({"undone": label}))
 }
@@ -630,16 +636,20 @@ fn redo(s: &mut Session, p: &Json) -> Result<Json> {
     let d = s.doc_mut()?;
     let mut label = String::new();
     let now = d.wb.clone();
+    let mut seq = d.remote.seq;
     for _ in 0..steps {
         let Some(e) = d.redo.pop() else { break };
-        let cur = crate::HistoryEntry { label: e.label.clone(), wb: d.wb.clone(), selection: d.selection.clone() };
+        let cur = crate::HistoryEntry { label: e.label.clone(), wb: d.wb.clone(), selection: d.selection.clone(), remote_seq: seq };
         d.undo.push(cur);
         label = e.label.clone();
         d.wb = e.wb;
         d.selection = e.selection;
+        seq = e.remote_seq;
     }
     super::extra::keep_watch_list(&now, &mut d.wb);
     d.calc.rebuild(&d.wb);
+    d.replay_remote_since(seq);
+    d.prune_remote_log();
     d.revision += 1;
     Ok(json!({"redone": label}))
 }

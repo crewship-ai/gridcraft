@@ -18,6 +18,7 @@ pub mod outline;
 pub mod paper;
 pub mod pivot;
 pub mod pivot_calc;
+pub mod remote;
 pub mod sample;
 pub mod selection;
 pub mod tables;
@@ -61,6 +62,9 @@ pub struct HistoryEntry {
     pub label: String,
     pub wb: Arc<Workbook>,
     pub selection: Selection,
+    /// [`remote::RemoteLog::seq`] when `wb` was current: remote ops after it are re-applied
+    /// when this snapshot is restored.
+    pub remote_seq: u64,
 }
 
 /// The clipboard: a block of cells (with formulas and styles) or marching-ants reference.
@@ -112,6 +116,8 @@ pub struct DocState {
     /// The format `path`'s content was recognised as when its extension doesn't name one (an
     /// XLSX called `budget.dat`): Save writes it back in that format.
     pub content_kind: Option<io::FileKind>,
+    /// Remote ops from a host ([`DocState::apply_remote`]) still needed to restore history.
+    pub remote: remote::RemoteLog,
 }
 
 static NEXT_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -137,6 +143,7 @@ impl DocState {
             sheet_selections: vec![],
             unlocked_ranges: vec![],
             content_kind: None,
+            remote: Default::default(),
         }
     }
     pub fn is_dirty(&self) -> bool {
@@ -350,11 +357,13 @@ impl Session {
             && let Some(d) = self.docs.iter_mut().find(|d| d.uid == uid)
             && !Arc::ptr_eq(&d.wb, &wb)
         {
-            d.undo.push(HistoryEntry { label: spec.label.trim_end_matches('…').to_string(), wb, selection: sel });
+            let remote_seq = d.remote.seq;
+            d.undo.push(HistoryEntry { label: spec.label.trim_end_matches('…').to_string(), wb, selection: sel, remote_seq });
             if d.undo.len() > UNDO_LIMIT {
                 d.undo.remove(0);
             }
             d.redo.clear();
+            d.prune_remote_log();
             d.revision += 1;
         }
         result
