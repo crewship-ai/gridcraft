@@ -364,6 +364,8 @@ pub(crate) fn commit<R>(d: &mut DocState, f: impl FnOnce(&mut Ctx) -> Result<R>)
     }
     d.wb = std::sync::Arc::new(wb);
     d.selection = sel;
+    d.touched.extend_from_slice(&changed);
+    d.touched_structural |= structural;
     Ok(r)
 }
 

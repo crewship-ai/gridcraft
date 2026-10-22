@@ -56,6 +56,61 @@ impl RemoteOp {
     }
 }
 
+/// What one top-level local command changed, as cell ops a host can commit (recorded when
+/// [`crate::Session::record_local_ops`] is on). Undo and redo are commands too: their edit holds
+/// the cells they put back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalEdit {
+    /// The command id (`cell.set`, `edit.paste`, `edit.undo`…).
+    pub command: String,
+    /// Cell content changes, by sheet name, in the order the command touched them.
+    pub ops: Vec<RemoteOp>,
+    /// `false` when the command also changed what cell ops can't express: rows, columns or
+    /// sheets moved (then `ops` is empty), or a sheet changed without any cell content change
+    /// (formatting). The embedding decides what to do (refuse, warn).
+    pub complete: bool,
+    /// Rows, columns or sheets moved, or sheets were added, removed or renamed.
+    pub structural: bool,
+    /// The command recorded an undo step (so `edit.undo` takes exactly this edit back).
+    pub undo_step: bool,
+}
+
+impl LocalEdit {
+    pub fn ops_json(&self) -> Vec<Json> {
+        self.ops.iter().map(|o| serde_json::json!({"op": "cell.set", "sheet": o.sheet, "cell": o.cell.a1(), "input": o.input})).collect()
+    }
+}
+
+/// The cell ops between `before` and `after` for the cells a command reported as changed.
+pub(crate) fn local_edit(
+    command: &str,
+    before: &gridcraft_model::Workbook,
+    after: &gridcraft_model::Workbook,
+    touched: &[gridcraft_calc::Key],
+    structural: bool,
+) -> LocalEdit {
+    let same_sheets = before.sheets.len() == after.sheets.len() && before.sheets.iter().zip(after.sheets.iter()).all(|(a, b)| a.name == b.name);
+    if structural || !same_sheets {
+        return LocalEdit { command: command.to_string(), ops: vec![], complete: false, structural: true, undo_step: false };
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut ops = Vec::new();
+    for &(si, c) in touched {
+        if !seen.insert((si, c)) {
+            continue;
+        }
+        let (Some(a), Some(b)) = (before.sheet(si), after.sheet(si)) else { continue };
+        let new = b.input_text(c);
+        if a.input_text(c) != new {
+            ops.push(RemoteOp { sheet: b.name.clone(), cell: c, input: new });
+        }
+    }
+    // A sheet that changed although the command reported no cell on it: not expressible.
+    let complete =
+        before.sheets.iter().zip(after.sheets.iter()).enumerate().all(|(si, (a, b))| Arc::ptr_eq(a, b) || touched.iter().any(|(s, _)| *s == si));
+    LocalEdit { command: command.to_string(), ops, complete, structural: false, undo_step: false }
+}
+
 /// Remote ops applied since the oldest history snapshot, by local sequence number.
 #[derive(Clone, Debug, Default)]
 pub struct RemoteLog {
@@ -411,5 +466,100 @@ mod tests {
         remote(&mut s, 52, "A1", "52");
         assert!(s.doc().unwrap().remote.is_empty());
         assert_eq!(input(&s, "A1"), "52");
+    }
+
+    fn recording() -> Session {
+        let mut s = session();
+        s.record_local_ops = true;
+        s
+    }
+    fn ops_of(s: &mut Session) -> Vec<(String, String, String, bool)> {
+        s.take_local_ops()
+            .into_iter()
+            .flat_map(|e| {
+                let c = e.complete;
+                let cmd = e.command.clone();
+                let mut v: Vec<_> = e.ops.into_iter().map(|o| (cmd.clone(), format!("{}!{}", o.sheet, o.cell.a1()), o.input, c)).collect();
+                if v.is_empty() {
+                    v.push((cmd, String::new(), String::new(), c));
+                }
+                v
+            })
+            .collect()
+    }
+    fn op(cmd: &str, at: &str, input: &str) -> (String, String, String, bool) {
+        (cmd.into(), at.into(), input.into(), true)
+    }
+
+    #[test]
+    fn local_ops_come_from_commands_with_sheet_names() {
+        let mut s = recording();
+        set(&mut s, "A1", "1");
+        s.execute("cell.set", json!({"cell": "A1", "input": "1"})).unwrap(); // no change: no op
+        assert_eq!(ops_of(&mut s), vec![op("cell.set", "Sheet1!A1", "1")]);
+        s.execute("home.insertSheet", json!({})).unwrap();
+        let added = ops_of(&mut s);
+        assert!(added.iter().all(|o| !o.3), "a new sheet isn't a cell op: {added:?}");
+        let names: Vec<String> = s.doc().unwrap().wb.sheets.iter().map(|sh| sh.name.clone()).collect();
+        let other = names.iter().find(|n| *n != "Sheet1").unwrap().clone();
+        s.execute("cell.set", json!({"sheet": other, "cell": "B2", "input": "=1+1"})).unwrap();
+        assert_eq!(ops_of(&mut s), vec![op("cell.set", &format!("{other}!B2"), "=1+1")]);
+    }
+
+    #[test]
+    fn paste_fill_clear_undo_redo_emit_cell_ops() {
+        let mut s = recording();
+        set(&mut s, "A1", "1");
+        set(&mut s, "A2", "2");
+        assert_eq!(ops_of(&mut s), vec![op("cell.set", "Sheet1!A1", "1"), op("cell.set", "Sheet1!A2", "2")]);
+        s.execute("selection.set", json!({"range": "A1:A2"})).unwrap();
+        s.execute("edit.copy", json!({})).unwrap();
+        s.execute("selection.set", json!({"range": "C1"})).unwrap();
+        s.execute("edit.paste", json!({})).unwrap();
+        assert_eq!(ops_of(&mut s), vec![op("edit.paste", "Sheet1!C1", "1"), op("edit.paste", "Sheet1!C2", "2")]);
+        s.execute("edit.clearContents", json!({"range": "C2"})).unwrap();
+        assert_eq!(ops_of(&mut s), vec![op("edit.clearContents", "Sheet1!C2", "")]);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(ops_of(&mut s), vec![op("edit.undo", "Sheet1!C2", "2")]);
+        s.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(ops_of(&mut s), vec![op("edit.redo", "Sheet1!C2", "")]);
+        s.execute("selection.set", json!({"range": "A1:A4"})).unwrap();
+        s.execute("edit.fillDown", json!({})).unwrap();
+        let fill = ops_of(&mut s);
+        assert_eq!(fill, vec![op("edit.fillDown", "Sheet1!A2", "1"), op("edit.fillDown", "Sheet1!A3", "1"), op("edit.fillDown", "Sheet1!A4", "1")]);
+    }
+
+    #[test]
+    fn remote_ops_and_undo_of_nothing_are_not_local_ops() {
+        let mut s = recording();
+        remote(&mut s, 1, "A1", "host");
+        assert!(ops_of(&mut s).is_empty());
+        set(&mut s, "B1", "mine");
+        remote(&mut s, 2, "B2", "host2");
+        let _ = ops_of(&mut s);
+        undo(&mut s);
+        assert_eq!(ops_of(&mut s), vec![op("edit.undo", "Sheet1!B1", "")], "the replayed remote op isn't reported");
+    }
+
+    #[test]
+    fn structural_and_formatting_edits_are_reported_incomplete() {
+        let mut s = recording();
+        set(&mut s, "A1", "1");
+        let _ = ops_of(&mut s);
+        s.execute("home.insertRows", json!({"range": "A1"})).unwrap();
+        let e = s.take_local_ops();
+        assert_eq!(e.len(), 1);
+        assert!(!e[0].complete && e[0].ops.is_empty() && e[0].structural && e[0].undo_step, "{e:?}");
+        s.execute("home.bold", json!({"range": "A1"})).unwrap();
+        let e = s.take_local_ops();
+        assert_eq!(e.len(), 1);
+        assert!(e[0].ops.is_empty() && !e[0].complete && !e[0].structural && e[0].undo_step, "formatting isn't a cell op: {e:?}");
+    }
+
+    #[test]
+    fn nothing_is_recorded_unless_asked() {
+        let mut s = session();
+        set(&mut s, "A1", "1");
+        assert!(s.take_local_ops().is_empty());
     }
 }

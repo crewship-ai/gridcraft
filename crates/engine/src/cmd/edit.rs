@@ -615,9 +615,18 @@ fn undo(s: &mut Session, p: &Json) -> Result<Json> {
     for _ in 0..steps {
         let Some(e) = d.undo.pop() else { break };
         // Redo goes back to the undone edit's cells, not wherever the user clicked before undoing (#1855).
-        let cur = crate::HistoryEntry { label: e.label.clone(), wb: d.wb.clone(), selection: e.selection.clone(), remote_seq: seq };
+        let cur = crate::HistoryEntry {
+            label: e.label.clone(),
+            wb: d.wb.clone(),
+            selection: e.selection.clone(),
+            remote_seq: seq,
+            touched: e.touched.clone(),
+            structural: e.structural,
+        };
         d.redo.push(cur);
         label = e.label.clone();
+        d.touched.extend_from_slice(&e.touched);
+        d.touched_structural |= e.structural;
         d.wb = e.wb;
         d.selection = e.selection;
         seq = e.remote_seq;
@@ -639,9 +648,18 @@ fn redo(s: &mut Session, p: &Json) -> Result<Json> {
     let mut seq = d.remote.seq;
     for _ in 0..steps {
         let Some(e) = d.redo.pop() else { break };
-        let cur = crate::HistoryEntry { label: e.label.clone(), wb: d.wb.clone(), selection: d.selection.clone(), remote_seq: seq };
+        let cur = crate::HistoryEntry {
+            label: e.label.clone(),
+            wb: d.wb.clone(),
+            selection: d.selection.clone(),
+            remote_seq: seq,
+            touched: e.touched.clone(),
+            structural: e.structural,
+        };
         d.undo.push(cur);
         label = e.label.clone();
+        d.touched.extend_from_slice(&e.touched);
+        d.touched_structural |= e.structural;
         d.wb = e.wb;
         d.selection = e.selection;
         seq = e.remote_seq;

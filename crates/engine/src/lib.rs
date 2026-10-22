@@ -65,6 +65,10 @@ pub struct HistoryEntry {
     /// [`remote::RemoteLog::seq`] when `wb` was current: remote ops after it are re-applied
     /// when this snapshot is restored.
     pub remote_seq: u64,
+    /// Cells the step changed (sheet index, cell), so undo/redo can report what they change.
+    pub touched: Arc<[gridcraft_calc::Key]>,
+    /// The step moved cells (rows, columns, sheets): `touched` doesn't describe it.
+    pub structural: bool,
 }
 
 /// The clipboard: a block of cells (with formulas and styles) or marching-ants reference.
@@ -118,6 +122,9 @@ pub struct DocState {
     pub content_kind: Option<io::FileKind>,
     /// Remote ops from a host ([`DocState::apply_remote`]) still needed to restore history.
     pub remote: remote::RemoteLog,
+    /// Cells changed by the command running now (filled by `cmd::commit`, undo and redo).
+    pub(crate) touched: Vec<gridcraft_calc::Key>,
+    pub(crate) touched_structural: bool,
 }
 
 static NEXT_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -144,6 +151,8 @@ impl DocState {
             unlocked_ranges: vec![],
             content_kind: None,
             remote: Default::default(),
+            touched: Vec::new(),
+            touched_structural: false,
         }
     }
     pub fn is_dirty(&self) -> bool {
@@ -263,6 +272,12 @@ pub struct Session {
     /// Review › Notes › Show All Notes: every note is displayed. An application display setting
     /// (like Excel's comment indicator option), so it's not saved in the file.
     pub show_all_notes: bool,
+    /// Collect a [`remote::LocalEdit`] for every top-level command that changed the workbook
+    /// (a host-authority embedding sends them as mutations). Off by default.
+    pub record_local_ops: bool,
+    local_ops: Vec<remote::LocalEdit>,
+    /// Nesting depth of `execute` (commands that run other commands).
+    depth: u32,
 }
 
 impl Session {
@@ -328,8 +343,20 @@ impl Session {
             return Err(EngineError::Disabled(id.to_string(), why));
         }
         let before = self.active().map(|d| (d.uid, d.wb.clone(), d.selection.clone()));
+        let top = self.depth == 0;
+        let mark = match self.active_mut() {
+            Some(d) if top => {
+                d.touched.clear();
+                d.touched_structural = false;
+                0
+            }
+            Some(d) => d.touched.len(),
+            None => 0,
+        };
         let params = if params.is_null() { Json::Object(Default::default()) } else { params };
+        self.depth += 1;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (spec.run)(self, &params)));
+        self.depth = self.depth.saturating_sub(1);
         let result = match result {
             Ok(r) => r,
             Err(p) => {
@@ -352,21 +379,51 @@ impl Session {
                 self.journal.drain(..5_000);
             }
         }
+        let top_before = if top { before.as_ref().map(|(uid, wb, _)| (*uid, wb.clone())) } else { None };
+        let mut undo_step = false;
         if spec.undoable
             && let Some((uid, wb, sel)) = before
             && let Some(d) = self.docs.iter_mut().find(|d| d.uid == uid)
             && !Arc::ptr_eq(&d.wb, &wb)
         {
             let remote_seq = d.remote.seq;
-            d.undo.push(HistoryEntry { label: spec.label.trim_end_matches('…').to_string(), wb, selection: sel, remote_seq });
+            let touched: Arc<[gridcraft_calc::Key]> = d.touched.get(mark..).unwrap_or_default().into();
+            let structural = d.touched_structural;
+            d.undo.push(HistoryEntry { label: spec.label.trim_end_matches('…').to_string(), wb, selection: sel, remote_seq, touched, structural });
             if d.undo.len() > UNDO_LIMIT {
                 d.undo.remove(0);
             }
             d.redo.clear();
             d.prune_remote_log();
             d.revision += 1;
+            undo_step = true;
+        }
+        if top {
+            self.finish_top_level(id, top_before, result.is_ok(), undo_step);
         }
         result
+    }
+
+    /// After a top-level command: report what it changed when recording, and reset the
+    /// per-command change list.
+    fn finish_top_level(&mut self, id: &str, before: Option<(u64, Arc<Workbook>)>, ok: bool, undo_step: bool) {
+        let record = self.record_local_ops && ok;
+        let Some((uid, wb)) = before else { return };
+        let Some(d) = self.docs.iter_mut().find(|d| d.uid == uid) else { return };
+        if record && !Arc::ptr_eq(&d.wb, &wb) {
+            let mut edit = remote::local_edit(id, &wb, &d.wb, &d.touched, d.touched_structural);
+            edit.undo_step = undo_step;
+            if !edit.ops.is_empty() || !edit.complete {
+                self.local_ops.push(edit);
+            }
+        }
+        d.touched.clear();
+        d.touched_structural = false;
+    }
+
+    /// The local edits recorded since the last call (see [`Session::record_local_ops`]).
+    pub fn take_local_ops(&mut self) -> Vec<remote::LocalEdit> {
+        std::mem::take(&mut self.local_ops)
     }
 
     pub fn run(&mut self, id: &str, params: Json) -> std::result::Result<Json, String> {
