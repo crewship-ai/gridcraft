@@ -128,3 +128,35 @@ fn typing_at_full_speed_one_key_per_frame_still_works() {
     assert_eq!(input(&app, "A1"), "full");
     assert_eq!(active(&app), "A2");
 }
+
+#[test]
+fn remote_op_on_the_cell_being_edited_keeps_the_draft_and_redo() {
+    let (ctx, mut app) = app();
+    app.session.run("cell.set", serde_json::json!({"cell": "C1", "input": "mine"})).unwrap();
+    app.session.run("edit.undo", serde_json::json!({})).unwrap();
+    app.session.run("selection.set", serde_json::json!({"cell": "B2"})).unwrap();
+    frames(&ctx, &mut app, 2);
+    frame_with(&ctx, &mut app, typed("500"));
+    frames(&ctx, &mut app, 2);
+    let redo_len = app.session.active().unwrap().redo.len();
+    assert_eq!(redo_len, 1);
+
+    // Somebody else commits the same cell while it is open in the editor.
+    app.session.apply_remote(2, &[RemoteOp::set("Sheet1", "B2", "7").unwrap()]).unwrap();
+    app.after_engine();
+    frames(&ctx, &mut app, 3);
+
+    assert_eq!(input(&app, "B2"), "7", "the document shows the committed value underneath");
+    let ed = app.editor.as_ref().expect("the editor stays open");
+    assert_eq!((ed.text.as_str(), ed.cell.a1()), ("500", "B2".to_string()), "the draft is the user's until they commit or cancel");
+    assert_eq!(active(&app), "B2");
+    assert_eq!(app.session.active().unwrap().redo.len(), redo_len, "a remote op keeps the redo stack");
+
+    // Escape leaves the committed value; redo brings back only the local edit.
+    frame_with(&ctx, &mut app, key(Key::Escape).to_vec());
+    frames(&ctx, &mut app, 2);
+    assert!(app.editor.is_none());
+    assert_eq!(input(&app, "B2"), "7");
+    app.session.run("edit.redo", serde_json::json!({})).unwrap();
+    assert_eq!((input(&app, "C1").as_str(), input(&app, "B2").as_str()), ("mine", "7"));
+}
