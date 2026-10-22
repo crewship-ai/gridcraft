@@ -69,11 +69,7 @@ pub fn start() {
                         bridge.post_ready();
                     }
                     let authority = if authority_mode {
-                        crate::authority::Authority::new(
-                            query_param("parent_origin").unwrap_or_default(),
-                            query_param("client").unwrap_or_else(|| "editor".into()),
-                            query_param("debug").is_some(),
-                        )
+                        crate::authority::Authority::new(query_param("parent_origin").unwrap_or_default(), query_param("debug").is_some())
                     } else {
                         None
                     };

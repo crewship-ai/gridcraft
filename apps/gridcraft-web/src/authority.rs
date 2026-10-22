@@ -1,56 +1,60 @@
-//! Host-authority bridge (`?host=authority&parent_origin=<origin>`).
+//! Host-authority bridge, protocol 1 (`?host=authority&parent_origin=<origin>`).
 //!
 //! Unlike [`crate::host`] (same-origin parent, whole files, "saved" as soon as the bytes are
-//! handed over), here the embedding page is the authority over the document and may live on a
-//! different origin:
+//! handed over), here the embedding page owns the document and its revision log, and may live on
+//! another origin. The editor may run in a sandboxed frame with an opaque origin
+//! (`sandbox allow-scripts` without `allow-same-origin`): it needs no cookies or storage, and the
+//! parent sees its messages with origin `"null"`.
 //!
-//! - Handshake: the editor posts `gridcraft:hello` to `parent_origin` only; the parent answers
-//!   with `gridcraft:connect` and transfers a `MessagePort`. The connect is accepted only when
-//!   `event.origin == parent_origin` and `event.source` is the parent window. All further traffic
-//!   is JSON strings over that port (no wildcard target origins anywhere).
-//! - Editor → host: `mutation {mutation_id, base_rev, ops:[{op:"cell.set", sheet, cell, input}]}`
-//!   for every local change, detected by diffing cell inputs against the last state accounted
-//!   for; `resume {last_rev, pending:[mutation…]}` after the host reports it is back online.
-//! - Host → editor: `snapshot {rev, cells}`, `committed {rev, mutation_id, client_id, ops}` (in
-//!   rev order), `ack {mutation_id, rev}`, `rejected {mutation_id, code, current_rev, cells}`,
-//!   `offline`, `online`.
-//! - "Saved" only when every local mutation has a host ack (the host acks after it made the
-//!   commit durable). A rejection reverts the optimistic local change to the host's value and
-//!   keeps the lost input visible as "Not saved".
-//! - Remote commits are applied through the engine without touching the cell editor, the
-//!   selection or the undo/redo stacks (`Session::apply_remote`): undo/redo replay remote ops
-//!   onto restored snapshots, so a local Undo can't revert someone else's commit.
+//! Handshake (window messages, then a private `MessagePort`):
+//! - editor → parent, posted to `parent_origin` only:
+//!   `{type:"gridcraft:hello", protocol:1, version, bundle:{wasm,js}|null}`. `bundle` holds the
+//!   sha256 digests the build wrote into `<meta name="gridcraft-bundle">` (null in dev builds).
+//! - parent → editor: `{type:"gridcraft:connect", protocol:1}` with the port transferred. The
+//!   editor accepts it only when `event.origin == parent_origin` and `event.source` is the parent
+//!   window, and only for protocol 1.
 //!
-//! Limits: sheet 0 only, cell inputs only (no styles, structure, sheets), history rebasing
-//! by replaying the op on every snapshot (O(history) recalcs per remote op).
+//! On the port (JSON text):
+//! - editor → host: `mutation {seq, base_rev, ops}` with `ops: [{op:"cell.set", sheet, cell,
+//!   input}]` (sheet by name; an empty input clears). `seq` is monotonic per editor instance and
+//!   stays the same on retries; the host builds the idempotency key from it and its session.
+//!   `resume {last_rev, pending:[mutation…]}` after the host reports it is back online or after
+//!   a gap. `notice {code, command}` when a local command was refused (see below).
+//! - host → editor: `snapshot {rev, sheets:[{name, cells:{A1: input}}]}`,
+//!   `committed {rev, own?, seq?, ops}` in rev order, `ack {seq, rev}`,
+//!   `rejected {seq, code, current_rev, current:[op…]}`, `offline`, `online`, `dismiss`.
+//!
+//! Local changes come from the engine's commands (`Session::record_local_ops`), one mutation per
+//! command: typing, paste, fill, clear, undo and redo. Commands whose effect cell ops can't carry
+//! (inserting rows, sheets, formatting) are taken back right away and reported, so the editor
+//! never shows a state the host doesn't have.
+//!
+//! "Saved" only when every mutation has an ack (sent after the host made the commit durable).
+//! A rejection reverts the optimistic change to the host's value and shows "Not saved".
+//! Host commits apply through `Session::apply_remote`: not undoable by the local user, the
+//! selection and an open cell editor are untouched.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use gridcraft_engine::model::Workbook;
-use gridcraft_engine::remote::RemoteOp;
-use gridcraft_engine::{DocState, Session};
+use gridcraft_engine::DocState;
+use gridcraft_engine::model::{Sheet, Workbook};
+use gridcraft_engine::remote::{LocalEdit, RemoteOp};
 use gridcraft_ui_egui::SheetApp;
 use serde_json::{Value as Json, json};
 use wasm_bindgen::JsCast as _;
 use wasm_bindgen::JsValue;
 use wasm_bindgen::closure::Closure;
 
-const SHEET: usize = 0;
-
-#[derive(Clone, Debug)]
-struct Op {
-    cell: String,
-    input: String,
-}
+pub const PROTOCOL: u64 = 1;
 
 #[derive(Clone, Debug)]
 struct Pending {
-    mutation_id: String,
+    seq: u64,
     base_rev: u64,
-    ops: Vec<Op>,
+    ops: Vec<RemoteOp>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -68,52 +72,52 @@ struct Shared {
     inbound: VecDeque<Json>,
 }
 
+type CellKey = (String, String);
+
 pub struct Authority {
     window: web_sys::Window,
     parent: web_sys::Window,
     parent_origin: String,
-    client_id: String,
     debug: bool,
     shared: Rc<RefCell<Shared>>,
     loaded: bool,
     confirmed_rev: u64,
-    /// The host's committed inputs (sheet 0), A1 → input.
-    confirmed: BTreeMap<String, String>,
-    /// The workbook whose cell inputs are accounted for (confirmed or pending).
-    synced: Option<Arc<Workbook>>,
+    /// The host's committed inputs, (sheet, A1) → input.
+    confirmed: BTreeMap<CellKey, String>,
     pending: Vec<Pending>,
     next_seq: u64,
     online: bool,
     rejected: Option<String>,
+    /// A refused local command, shown until the next local edit.
+    notice: Option<String>,
     last_debug: String,
     /// The cell being edited and the host rev when its editor opened: the commit's precondition
     /// is "this cell is unchanged since I started typing", not "since I pressed Enter".
-    edit_start: Option<(String, u64)>,
+    edit_start: Option<(CellKey, u64)>,
 }
 
 impl Authority {
-    /// `None` when not framed or `parent_origin` is missing.
-    pub fn new(parent_origin: String, client_id: String, debug: bool) -> Option<Self> {
+    /// `None` when not framed or `parent_origin` is missing or a wildcard.
+    pub fn new(parent_origin: String, debug: bool) -> Option<Self> {
         let window = web_sys::window()?;
         let parent = window.parent().ok().flatten()?;
-        if js_sys::Object::is(&parent, &window) || parent_origin.is_empty() || parent_origin == "*" {
+        if js_sys::Object::is(&parent, &window) || parent_origin.is_empty() || parent_origin == "*" || parent_origin == "null" {
             return None;
         }
         Some(Self {
             window,
             parent,
             parent_origin,
-            client_id,
             debug,
             shared: Rc::default(),
             loaded: false,
             confirmed_rev: 0,
             confirmed: BTreeMap::new(),
-            synced: None,
             pending: vec![],
             next_seq: 1,
             online: false,
             rejected: None,
+            notice: None,
             last_debug: String::new(),
             edit_start: None,
         })
@@ -129,8 +133,18 @@ impl Authority {
             if event.origin() != origin || !event.source().is_some_and(|s| js_sys::Object::is(&s, &parent)) {
                 return;
             }
-            if event.data().as_string().as_deref() != Some("gridcraft:connect") {
+            let data = event.data();
+            let field = |k: &str| js_sys::Reflect::get(&data, &k.into()).ok();
+            if field("type").and_then(|v| v.as_string()).as_deref() != Some("gridcraft:connect") {
                 return;
+            }
+            let protocol = field("protocol").and_then(|v| v.as_f64());
+            if protocol != Some(PROTOCOL as f64) {
+                log::error!("host speaks protocol {protocol:?}, this editor {PROTOCOL}: not connecting");
+                return;
+            }
+            if shared.borrow().port.is_some() {
+                return; // one connection per editor instance
             }
             let Some(port) = event.ports().get(0).dyn_into::<web_sys::MessagePort>().ok() else { return };
             let inbox = shared.clone();
@@ -151,10 +165,13 @@ impl Authority {
         if self.window.add_event_listener_with_callback("message", on_window_message.as_ref().unchecked_ref()).is_ok() {
             on_window_message.forget();
         }
-        let hello = js_sys::Object::new();
-        let _ = js_sys::Reflect::set(&hello, &"type".into(), &"gridcraft:hello".into());
-        let _ = js_sys::Reflect::set(&hello, &"version".into(), &env!("CARGO_PKG_VERSION").into());
-        let _ = js_sys::Reflect::set(&hello, &"client_id".into(), &self.client_id.as_str().into());
+        let hello = json!({
+            "type": "gridcraft:hello",
+            "protocol": PROTOCOL,
+            "version": env!("CARGO_PKG_VERSION"),
+            "bundle": bundle_digests(&self.window),
+        });
+        let hello = js_sys::JSON::parse(&hello.to_string()).unwrap_or(JsValue::NULL);
         if let Err(e) = self.parent.post_message(&hello, &self.parent_origin) {
             log::error!("hello to the host failed: {e:?}");
         }
@@ -183,13 +200,19 @@ impl Authority {
 
     /// After each frame: apply what the host sent, send local changes, update "saved".
     pub fn sync(&mut self, app: &mut SheetApp, ctx: &egui::Context) {
+        app.session.record_local_ops = true;
         if self.loaded {
             self.send_local_changes(app);
+        } else {
+            // Nothing local counts before the host's snapshot.
+            let _ = app.session.take_local_ops();
         }
-        match &app.editor {
-            Some(ed) if self.edit_start.as_ref().is_none_or(|(c, _)| *c != ed.cell.a1()) => {
-                self.edit_start = Some((ed.cell.a1(), self.confirmed_rev));
-            }
+        let editing = app.editor.as_ref().and_then(|ed| {
+            let sheet = app.session.active()?.wb.sheets.get(ed.sheet)?.name.clone();
+            Some((sheet, ed.cell.a1()))
+        });
+        match editing {
+            Some(key) if self.edit_start.as_ref().is_none_or(|(k, _)| *k != key) => self.edit_start = Some((key, self.confirmed_rev)),
             None => self.edit_start = None,
             _ => {}
         }
@@ -217,8 +240,7 @@ impl Authority {
         match msg.get("type").and_then(Json::as_str).unwrap_or("") {
             "snapshot" => {
                 let rev = msg.get("rev").and_then(Json::as_u64).unwrap_or(0);
-                let cells = cells_of(msg.get("cells"));
-                self.load_snapshot(app, rev, cells);
+                self.load_snapshot(app, rev, msg);
                 self.online = true;
             }
             "committed" => {
@@ -227,44 +249,39 @@ impl Authority {
                     return; // replayed twice
                 }
                 if rev != self.confirmed_rev + 1 {
-                    // A gap: ask the host to replay from what we have.
                     log::warn!("rev gap: have {}, got {rev}", self.confirmed_rev);
                     self.resume();
                     return;
                 }
-                let mutation_id = msg.get("mutation_id").and_then(Json::as_str).unwrap_or("");
                 let ops = ops_of(msg.get("ops"));
-                if let Some(i) = self.pending.iter().position(|p| p.mutation_id == mutation_id) {
+                let own = msg.get("own").and_then(Json::as_bool).unwrap_or(false);
+                let seq = msg.get("seq").and_then(Json::as_u64);
+                if own && let Some(i) = self.pending.iter().position(|p| Some(p.seq) == seq) {
                     // Our own mutation (its ack was lost, e.g. across a reconnect): an ack.
                     let p = self.pending.remove(i);
-                    for op in p.ops {
-                        self.confirmed.insert(op.cell, op.input);
-                    }
+                    self.confirm(&p.ops);
                     self.confirmed_rev = rev;
                     return;
                 }
-                let pending_cells: Vec<String> = self.pending.iter().flat_map(|p| p.ops.iter().map(|o| o.cell.clone())).collect();
+                let pending_cells: Vec<CellKey> = self.pending.iter().flat_map(|p| p.ops.iter().map(key)).collect();
                 let mut to_apply = vec![];
                 for op in ops {
-                    self.confirmed.insert(op.cell.clone(), op.input.clone());
+                    self.confirmed.insert(key(&op), op.input.clone());
                     // A cell with an unacknowledged local change keeps showing it until the host
-                    // decides (it will reject ours if it conflicts).
-                    if !pending_cells.contains(&op.cell) {
+                    // decides (it rejects ours if it conflicts).
+                    if !pending_cells.contains(&key(&op)) {
                         to_apply.push(op);
                     }
                 }
                 self.confirmed_rev = rev;
                 apply_remote(app, rev, &to_apply);
-                self.synced = app.session.active().map(|d| d.wb.clone());
             }
             "ack" => {
-                let mutation_id = msg.get("mutation_id").and_then(Json::as_str).unwrap_or("");
+                let seq = msg.get("seq").and_then(Json::as_u64);
                 let rev = msg.get("rev").and_then(Json::as_u64).unwrap_or(0);
-                if let Some(i) = self.pending.iter().position(|p| p.mutation_id == mutation_id) {
+                if let Some(i) = self.pending.iter().position(|p| Some(p.seq) == seq) {
                     let p = self.pending.remove(i);
-                    for op in p.ops {
-                        self.confirmed.insert(op.cell, op.input);
-                    }
+                    self.confirm(&p.ops);
                     if rev == self.confirmed_rev + 1 {
                         self.confirmed_rev = rev;
                     } else if rev > self.confirmed_rev {
@@ -273,24 +290,23 @@ impl Authority {
                 }
             }
             "rejected" => {
-                let mutation_id = msg.get("mutation_id").and_then(Json::as_str).unwrap_or("");
+                let seq = msg.get("seq").and_then(Json::as_u64);
                 let code = msg.get("code").and_then(Json::as_str).unwrap_or("rejected").to_string();
-                let Some(i) = self.pending.iter().position(|p| p.mutation_id == mutation_id) else { return };
+                let Some(i) = self.pending.iter().position(|p| Some(p.seq) == seq) else { return };
                 let p = self.pending.remove(i);
                 // The host's current values for the rejected cells.
-                for (cell, input) in cells_of(msg.get("cells")) {
-                    self.confirmed.insert(cell, input);
+                for op in ops_of(msg.get("current")) {
+                    self.confirmed.insert(key(&op), op.input);
                 }
-                let still_pending: Vec<String> = self.pending.iter().flat_map(|q| q.ops.iter().map(|o| o.cell.clone())).collect();
-                let revert: Vec<Op> = p
+                let still_pending: Vec<CellKey> = self.pending.iter().flat_map(|q| q.ops.iter().map(key)).collect();
+                let revert: Vec<RemoteOp> = p
                     .ops
                     .iter()
-                    .filter(|o| !still_pending.contains(&o.cell))
-                    .map(|o| Op { cell: o.cell.clone(), input: self.confirmed.get(&o.cell).cloned().unwrap_or_default() })
+                    .filter(|o| !still_pending.contains(&key(o)))
+                    .map(|o| RemoteOp { input: self.confirmed.get(&key(o)).cloned().unwrap_or_default(), ..o.clone() })
                     .collect();
                 apply_remote(app, self.confirmed_rev, &revert);
-                self.synced = app.session.active().map(|d| d.wb.clone());
-                let lost: Vec<String> = p.ops.iter().map(|o| format!("{} = \"{}\"", o.cell, o.input)).collect();
+                let lost: Vec<String> = p.ops.iter().map(|o| format!("{} = \"{}\"", o.cell.a1(), o.input)).collect();
                 self.rejected = Some(format!("{code}: {}", lost.join(", ")));
             }
             "offline" => self.online = false,
@@ -298,73 +314,122 @@ impl Authority {
                 self.online = true;
                 self.resume();
             }
-            "dismiss" => self.rejected = None,
+            "dismiss" => {
+                self.rejected = None;
+                self.notice = None;
+            }
             other => log::warn!("unknown host message {other}"),
         }
     }
 
-    /// Ask the host to replay from our last rev and re-send unacknowledged mutations (same ids:
+    fn confirm(&mut self, ops: &[RemoteOp]) {
+        for op in ops {
+            self.confirmed.insert(key(op), op.input.clone());
+        }
+    }
+
+    /// Ask the host to replay from our last rev and re-send unacknowledged mutations (same seq:
     /// the host deduplicates).
     fn resume(&self) {
         let pending: Vec<Json> = self.pending.iter().map(mutation_json).collect();
         self.post(&json!({"type": "resume", "last_rev": self.confirmed_rev, "pending": pending}));
     }
 
-    fn load_snapshot(&mut self, app: &mut SheetApp, rev: u64, cells: Vec<(String, String)>) {
-        let mut tmp = Session::new();
-        tmp.add_document(DocState::new(Workbook::new(), None, "Workbook".into()));
-        for (cell, input) in &cells {
-            if let Err(e) = tmp.execute_headless("cell.set", json!({"sheet": SHEET, "cell": cell, "input": input})) {
-                log::error!("snapshot cell {cell}: {e}");
+    fn load_snapshot(&mut self, app: &mut SheetApp, rev: u64, msg: &Json) {
+        // `sheets: [{name, cells}]`; a bare `cells` map is one sheet.
+        let sheets: Vec<(String, Json)> = match msg.get("sheets").and_then(Json::as_array) {
+            Some(list) => {
+                list.iter().filter_map(|s| Some((s.get("name")?.as_str()?.to_string(), s.get("cells").cloned().unwrap_or(Json::Null)))).collect()
             }
+            None => vec![("Sheet1".to_string(), msg.get("cells").cloned().unwrap_or(Json::Null))],
+        };
+        let mut wb = Workbook::new();
+        wb.sheets.clear();
+        for (name, _) in &sheets {
+            wb.sheets.push(Arc::new(Sheet::new(name.clone())));
         }
-        let Some(mut doc) = tmp.active().cloned() else { return };
-        doc.undo.clear();
-        doc.redo.clear();
+        if wb.sheets.is_empty() {
+            wb = Workbook::new();
+        }
+        let ops: Vec<RemoteOp> = sheets
+            .iter()
+            .flat_map(|(name, cells)| {
+                cells
+                    .as_object()
+                    .into_iter()
+                    .flat_map(|m| m.iter())
+                    .filter_map(|(cell, input)| RemoteOp::set(name, cell, input.as_str().unwrap_or_default()).ok())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let mut doc = DocState::new(wb, None, "Workbook".into());
+        if let Err(e) = doc.apply_remote(rev, &ops) {
+            log::error!("snapshot at rev {rev}: {e}");
+        }
         doc.saved = doc.wb.clone();
-        doc.title = "Workbook".into();
         while !app.session.documents().is_empty() {
             app.session.close_document(0);
         }
         app.session.add_document(doc);
-        self.synced = app.session.active().map(|d| d.wb.clone());
-        self.confirmed = cells.into_iter().collect();
+        let _ = app.session.take_local_ops();
+        self.confirmed = ops.into_iter().map(|o| (key(&o), o.input)).collect();
         self.confirmed_rev = rev;
         self.pending.clear();
         self.loaded = true;
     }
 
-    fn send_local_changes(&mut self, app: &SheetApp) {
-        let Some(d) = app.session.active() else { return };
-        let Some(synced) = &self.synced else { return };
-        if Arc::ptr_eq(synced, &d.wb) {
-            return;
+    fn send_local_changes(&mut self, app: &mut SheetApp) {
+        for edit in app.session.take_local_ops() {
+            if !edit.complete && edit.ops.is_empty() {
+                self.refuse(app, &edit);
+                continue;
+            }
+            if edit.ops.is_empty() {
+                continue;
+            }
+            if !edit.complete {
+                // Contents are shared; the formatting part of the same command stays local.
+                self.notice = Some(format!("{}: only cell contents are shared", edit.command));
+            }
+            let base_rev = match &self.edit_start {
+                Some((k, rev)) if edit.ops.iter().any(|o| key(o) == *k) => (*rev).min(self.confirmed_rev),
+                _ => self.confirmed_rev,
+            };
+            let p = Pending { seq: self.next_seq, base_rev, ops: edit.ops };
+            self.next_seq += 1;
+            // A new local edit after a rejection: the rejection notice has been seen.
+            self.rejected = None;
+            self.post(&mutation_json(&p));
+            self.pending.push(p);
         }
-        let ops = diff_inputs(synced, &d.wb);
-        self.synced = Some(d.wb.clone());
-        if ops.is_empty() {
-            return;
+    }
+
+    /// A command whose effect cell ops can't carry: take it back so the editor keeps showing
+    /// only what the host has, and say so.
+    fn refuse(&mut self, app: &mut SheetApp, edit: &LocalEdit) {
+        if edit.undo_step && app.session.execute("edit.undo", json!({})).is_ok() {
+            if let Some(d) = app.session.active_mut() {
+                d.redo.pop();
+            }
+            let _ = app.session.take_local_ops();
+            app.after_engine();
+            let what = if edit.structural { "inserting or deleting rows, columns or sheets" } else { "formatting" };
+            self.notice = Some(format!("{} isn't shared yet ({what}): undone", edit.command));
+            self.post(&json!({"type": "notice", "code": "unsupported_command", "command": edit.command}));
         }
-        let base_rev = match &self.edit_start {
-            Some((cell, rev)) if ops.iter().any(|o| o.cell == *cell) => (*rev).min(self.confirmed_rev),
-            _ => self.confirmed_rev,
-        };
-        let p = Pending { mutation_id: format!("{}-{}", self.client_id, self.next_seq), base_rev, ops };
-        self.next_seq += 1;
-        // A new local edit after a rejection: the rejection notice has been seen.
-        self.rejected = None;
-        self.post(&mutation_json(&p));
-        self.pending.push(p);
     }
 
     fn draw_status(&self, ctx: &egui::Context, status: &Status) {
-        let (text, color) = match status {
+        let (mut text, color) = match status {
             Status::Connecting => ("Connecting…".to_string(), egui::Color32::GRAY),
             Status::Saved => (format!("Saved · rev {}", self.confirmed_rev), egui::Color32::from_rgb(0x1e, 0x7b, 0x34)),
             Status::Saving => (format!("Saving… ({} pending)", self.pending.len()), egui::Color32::from_rgb(0xb2, 0x6b, 0x00)),
             Status::Offline => (format!("Offline · not saved ({} pending)", self.pending.len()), egui::Color32::from_rgb(0xb2, 0x6b, 0x00)),
             Status::NotSaved(why) => (format!("Not saved · {why}"), egui::Color32::from_rgb(0xc0, 0x1c, 0x1c)),
         };
+        if let Some(n) = &self.notice {
+            text = format!("{text} · {n}");
+        }
         egui::Area::new(egui::Id::new("host_authority_status")).anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-8.0, -30.0)).interactable(false).show(
             ctx,
             |ui| {
@@ -378,22 +443,27 @@ impl Authority {
     /// Test-only state report (`&debug=1`) so a headless test can assert what is on screen.
     fn post_debug(&mut self, app: &SheetApp, status: &Status) {
         let Some(d) = app.session.active() else { return };
-        let mut cells = BTreeMap::new();
-        if let Some(sh) = d.wb.sheets.get(SHEET) {
+        let mut sheets = BTreeMap::new();
+        for sh in &d.wb.sheets {
+            let mut cells = BTreeMap::new();
             for (c, _) in sh.cells.iter() {
                 let t = sh.input_text(c);
                 if !t.is_empty() {
                     cells.insert(c.a1(), t);
                 }
             }
+            sheets.insert(sh.name.clone(), cells);
         }
+        let first = d.wb.sheets.first().and_then(|s| sheets.get(&s.name)).cloned().unwrap_or_default();
         let editor = app.editor.as_ref().map(|e| json!({"cell": e.cell.a1(), "text": e.text, "caret": e.caret}));
         let state = json!({
             "type": "debug",
             "status": format!("{status:?}"),
+            "notice": self.notice,
             "rev": self.confirmed_rev,
             "pending": self.pending.len(),
-            "cells": cells,
+            "cells": first,
+            "sheets": sheets,
             "editor": editor,
             "selection": {"active": d.selection.active.a1(), "ranges": d.selection.ranges.iter().map(|r| r.a1()).collect::<Vec<_>>()},
             "undo": d.undo.iter().map(|h| h.label.clone()).collect::<Vec<_>>(),
@@ -408,60 +478,47 @@ impl Authority {
     }
 }
 
-fn mutation_json(p: &Pending) -> Json {
-    json!({
-        "type": "mutation",
-        "mutation_id": p.mutation_id,
-        "base_rev": p.base_rev,
-        "ops": p.ops.iter().map(|o| json!({"op": "cell.set", "sheet": SHEET, "cell": o.cell, "input": o.input})).collect::<Vec<_>>(),
-    })
+fn key(op: &RemoteOp) -> CellKey {
+    (op.sheet.clone(), op.cell.a1())
 }
 
-fn ops_of(v: Option<&Json>) -> Vec<Op> {
+fn mutation_json(p: &Pending) -> Json {
+    let ops: Vec<Json> = p.ops.iter().map(|o| json!({"op": "cell.set", "sheet": o.sheet, "cell": o.cell.a1(), "input": o.input})).collect();
+    json!({"type": "mutation", "seq": p.seq, "base_rev": p.base_rev, "ops": ops})
+}
+
+fn ops_of(v: Option<&Json>) -> Vec<RemoteOp> {
     v.and_then(Json::as_array)
-        .map(|a| {
-            a.iter()
-                .filter(|o| o.get("op").and_then(Json::as_str) == Some("cell.set"))
-                .filter_map(|o| {
-                    Some(Op { cell: o.get("cell")?.as_str()?.to_string(), input: o.get("input").and_then(Json::as_str).unwrap_or("").to_string() })
-                })
-                .collect()
-        })
+        .map(|a| a.iter().filter_map(|o| RemoteOp::from_json(o).map_err(|e| log::warn!("host op ignored: {e}")).ok()).collect())
         .unwrap_or_default()
 }
 
-fn cells_of(v: Option<&Json>) -> Vec<(String, String)> {
-    v.and_then(Json::as_object).map(|m| m.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect()).unwrap_or_default()
-}
-
-/// Cells (sheet 0) whose input differs between two workbooks.
-fn diff_inputs(old: &Workbook, new: &Workbook) -> Vec<Op> {
-    let (Some(a), Some(b)) = (old.sheets.get(SHEET), new.sheets.get(SHEET)) else { return vec![] };
-    if Arc::ptr_eq(a, b) {
-        return vec![];
+/// The digests the release build wrote into `<meta name="gridcraft-bundle"
+/// content="wasm=sha256:<hex> js=sha256:<hex>">`; `null` when absent (dev builds).
+fn bundle_digests(window: &web_sys::Window) -> Json {
+    let content =
+        window.document().and_then(|d| d.query_selector("meta[name=\"gridcraft-bundle\"]").ok().flatten()).and_then(|m| m.get_attribute("content"));
+    let Some(content) = content else { return Json::Null };
+    let mut out = serde_json::Map::new();
+    for part in content.split_whitespace() {
+        if let Some((k, v)) = part.split_once('=')
+            && (k == "wasm" || k == "js")
+            && v.strip_prefix("sha256:").is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            out.insert(k.to_string(), Json::String(v.to_string()));
+        }
     }
-    let mut keys = std::collections::BTreeSet::new();
-    keys.extend(a.cells.iter().map(|(c, _)| c));
-    keys.extend(b.cells.iter().map(|(c, _)| c));
-    keys.into_iter()
-        .filter_map(|c| {
-            let (x, y) = (a.input_text(c), b.input_text(c));
-            (x != y).then(|| Op { cell: c.a1(), input: y })
-        })
-        .collect()
+    if out.contains_key("wasm") && out.contains_key("js") { Json::Object(out) } else { Json::Null }
 }
 
 /// Apply host-committed ops (or a reconcile to the host's values) through the engine's remote
 /// path: no undo step, redo kept, no journal, selection and the open cell editor untouched; a
 /// later local undo replays them instead of reverting them.
-fn apply_remote(app: &mut SheetApp, rev: u64, ops: &[Op]) {
+fn apply_remote(app: &mut SheetApp, rev: u64, ops: &[RemoteOp]) {
     if ops.is_empty() {
         return;
     }
-    let Some(sheet) = app.session.active().and_then(|d| d.wb.sheets.get(SHEET)).map(|s| s.name.clone()) else { return };
-    let ops: Vec<RemoteOp> =
-        ops.iter().filter_map(|o| RemoteOp::set(&sheet, &o.cell, &o.input).map_err(|e| log::error!("remote {}: {e}", o.cell)).ok()).collect();
-    if let Err(e) = app.session.apply_remote(rev, &ops) {
+    if let Err(e) = app.session.apply_remote(rev, ops) {
         log::error!("remote ops at rev {rev}: {e}");
     }
     app.after_engine();
