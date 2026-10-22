@@ -82,3 +82,31 @@ sibling Craft apps do with `?webgl` / `?cpu`), document them here; they also wor
 iframe `src`.
 
 A browser with neither WebGPU nor WebGL2 gets a message in place of the app.
+
+## Reproducible bundle with a pinned manifest
+
+For hosts that pin exactly what they serve, `packaging/web/repro-build.sh <out_dir>` builds the
+site with the pinned toolchain (`rust-toolchain.toml`, `packaging/web/toolchain.lock`; tools from
+`packaging/web/fetch-tools.sh <dir>`, passed as `GRIDCRAFT_WEB_TOOLS=<dir>`) so that two builds of
+one commit are byte-identical, whatever the checkout path, target dir or cargo home.
+
+`<out_dir>/manifest.json` lists every served file with its sha256, plus the source commit and the
+toolchain:
+
+```json
+{
+  "files": { "index.html": "<sha256>", "gridcraft-web-<hash>_bg.wasm": "<sha256>", "…": "…" },
+  "source_commit": "<40-hex commit>",
+  "toolchain": { "rustc": "…", "trunk": "…", "wasm_bindgen": "…", "wasm_opt": "…", "…": "…" }
+}
+```
+
+The format is strict (exactly these keys, clean relative paths, lowercase hex digests; checked by
+`packaging/web/bundle-manifest.py check <dir>`). The **bundle digest** is the sha256 of the
+manifest's exact bytes (`<out_dir>/bundle-digest.txt`). `<out_dir>/bundle/<digest>/` (also as
+`gridcraft-web-bundle.tar`) is the served layout: the files plus `manifest.json`, meant to be
+served at `/b/<digest>/`.
+
+`.github/workflows/web-repro.yml` builds twice on two runners, requires identical output, checks
+the manifest and uploads the bundle as the `gridcraft-web-bundle-<digest>` artifact; the digest
+is in the job summary.
