@@ -29,6 +29,9 @@ pub fn start() {
         // workbooks in it and stores what it saves (`host`).
         let bridge = if query_param("host").as_deref() == Some("parent") { crate::host::Bridge::new() } else { None };
         let app_bridge = bridge.clone();
+        // `?host=authority&parent_origin=<origin>&client=<id>`: a (possibly cross-origin)
+        // host owns the document; see `authority`.
+        let authority_mode = query_param("host").as_deref() == Some("authority");
         let result = eframe::WebRunner::new()
             .start(
                 canvas,
@@ -37,7 +40,7 @@ pub fn start() {
                     let inbox: Inbox = Inbox::default();
                     let mut session = Session::new();
                     // In host mode the parent sends the workbook to edit; no sample meanwhile.
-                    let q = if app_bridge.is_some() { String::new() } else { query() };
+                    let q = if app_bridge.is_some() || authority_mode { String::new() } else { query() };
                     if let Some(name) = q.split(['?', '&']).find_map(|kv| kv.strip_prefix("sample=")) {
                         let _ = session.execute("file.new", serde_json::json!({"sample": name}));
                     } else if q.contains("sample") {
@@ -65,7 +68,19 @@ pub fn start() {
                         }
                         bridge.post_ready();
                     }
-                    Ok(Box::new(WebShell { app, inbox, bridge: app_bridge }))
+                    let authority = if authority_mode {
+                        crate::authority::Authority::new(
+                            query_param("parent_origin").unwrap_or_default(),
+                            query_param("client").unwrap_or_else(|| "editor".into()),
+                            query_param("debug").is_some(),
+                        )
+                    } else {
+                        None
+                    };
+                    if let Some(a) = &authority {
+                        a.connect(cc.egui_ctx.clone());
+                    }
+                    Ok(Box::new(WebShell { app, inbox, bridge: app_bridge, authority }))
                 }),
             )
             .await;
@@ -93,6 +108,7 @@ struct WebShell {
     app: SheetApp,
     inbox: Inbox,
     bridge: Option<crate::host::Bridge>,
+    authority: Option<crate::authority::Authority>,
 }
 
 impl eframe::App for WebShell {
@@ -123,6 +139,10 @@ impl eframe::App for WebShell {
         self.app.ui(ui);
         if let Some(bridge) = &self.bridge {
             bridge.sync(&mut self.app);
+        }
+        if let Some(authority) = &mut self.authority {
+            let ctx = ui.ctx().clone();
+            authority.sync(&mut self.app, &ctx);
         }
     }
 }
