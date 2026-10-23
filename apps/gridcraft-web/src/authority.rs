@@ -23,6 +23,9 @@
 //!   writer's change to that cell.
 //! - "Saved" only when every mutation has an ack (sent once the host made the commit durable).
 //!   A rejection shows the host's value again and "Not saved".
+//! - A host `snapshot` after the first (a reload) keeps the open cell editor, the selection and,
+//!   when only cell contents changed, the undo history; unconfirmed mutations the host did not
+//!   list in `discarded` stay on screen and are sent again unchanged (`document::load_snapshot`).
 //!
 //! Test hook: with `&debug=1` in the URL, or `globalThis.__gridcraftDebug === true` set before
 //! the page's scripts run (a test harness can inject it; the bridge never sees it), the editor
@@ -32,16 +35,15 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
-use std::sync::Arc;
 
-use gridcraft_engine::DocState;
 use gridcraft_ui_egui::SheetApp;
 use serde_json::{Value as Json, json};
 use wasm_bindgen::JsCast as _;
 use wasm_bindgen::JsValue;
 use wasm_bindgen::closure::Closure;
 
-use crate::protocol::{self, Effect, Status, Sync};
+use crate::document;
+use crate::protocol::{self, Status, Sync};
 
 #[derive(Default)]
 struct Shared {
@@ -149,102 +151,15 @@ impl Authority {
 
     /// After each frame: apply what the host sent, send local changes, update "saved".
     pub fn sync(&mut self, app: &mut SheetApp, ctx: &egui::Context) {
-        app.session.record_local_ops = true;
-        if self.sync.loaded {
-            for edit in app.session.take_local_ops() {
-                let effects = self.sync.local_edit(edit);
-                self.run(app, effects);
-            }
-        } else {
-            // Nothing local counts before the host's snapshot.
-            let _ = app.session.take_local_ops();
+        let inbound: Vec<String> = self.shared.borrow_mut().inbound.drain(..).collect();
+        for msg in document::step(&mut self.sync, app, inbound) {
+            self.post(&msg);
         }
-        let editing = app.editor.as_ref().and_then(|ed| {
-            let sheet = app.session.active()?.wb.sheets.get(ed.sheet)?.name.clone();
-            Some((sheet, ed.cell.a1()))
-        });
-        self.sync.editing(editing.clone());
-        loop {
-            let next = self.shared.borrow_mut().inbound.pop_front();
-            let Some(text) = next else { break };
-            match protocol::parse_host(&text) {
-                Ok(msg) => {
-                    let effects = self.sync.on_host(msg);
-                    self.run(app, effects);
-                }
-                Err(e) => log::warn!("host message ignored: {e}"),
-            }
-        }
-        // Which cell has an open, uncommitted editor (its address, never its text): the host
-        // hears of each change once, after any commit this frame sent.
-        let effects = self.sync.drafts(editing);
-        self.run(app, effects);
         let status = self.sync.status();
-        if let Some(d) = app.session.active_mut() {
-            // The unsaved-changes flag follows host acks, never "handed over".
-            if status == Status::Saved {
-                d.saved = d.wb.clone();
-            } else if !d.is_dirty() {
-                d.saved = Arc::new((*d.wb).clone());
-            }
-        }
         self.draw_status(ctx, &status);
         if self.debug {
             self.write_debug(app, &status);
         }
-    }
-
-    fn run(&mut self, app: &mut SheetApp, effects: Vec<Effect>) {
-        for effect in effects {
-            match effect {
-                Effect::Post(msg) => self.post(&msg),
-                Effect::Load { rev, snapshot } => self.load(app, rev, &snapshot),
-                Effect::Apply { rev, ops } => {
-                    if let Err(e) = app.session.apply_remote(rev, &ops) {
-                        log::error!("remote ops at rev {rev}: {e}");
-                    }
-                    app.after_engine();
-                }
-                Effect::Undo => {
-                    if app.session.execute("edit.undo", json!({})).is_ok() {
-                        if let Some(d) = app.session.active_mut() {
-                            d.redo.pop();
-                        }
-                        let _ = app.session.take_local_ops();
-                        app.after_engine();
-                    }
-                }
-            }
-        }
-    }
-
-    /// Replaces the open workbook with the host's snapshot; the view's selection is kept where
-    /// it still fits.
-    fn load(&mut self, app: &mut SheetApp, rev: u64, snapshot: &Json) {
-        let wb = match protocol::workbook_from_snapshot(snapshot) {
-            Ok(wb) => wb,
-            Err(e) => {
-                log::error!("snapshot at rev {rev}: {e}");
-                self.sync.rejected = Some(format!("the workbook could not be read: {e}"));
-                return;
-            }
-        };
-        let inputs = protocol::inputs_of(&wb);
-        let previous = app.session.active().map(|d| (d.sheet_index(), d.selection.clone()));
-        let mut doc = DocState::new(wb, None, "Workbook".into());
-        if let Some((sheet, selection)) = previous
-            && doc.sheet_index() == sheet
-        {
-            doc.selection = selection;
-        }
-        doc.saved = doc.wb.clone();
-        while !app.session.documents().is_empty() {
-            app.session.close_document(0);
-        }
-        app.session.add_document(doc);
-        let _ = app.session.take_local_ops();
-        app.after_engine();
-        self.sync.loaded(rev, inputs);
     }
 
     fn draw_status(&self, ctx: &egui::Context, status: &Status) {

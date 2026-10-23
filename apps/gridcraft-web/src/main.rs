@@ -17,6 +17,9 @@
 
 #[cfg(target_arch = "wasm32")]
 mod authority;
+// The document side of a host snapshot; tests run natively.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod document;
 #[cfg(target_arch = "wasm32")]
 mod host;
 // Plain data; the browser glue (`authority`) uses it, tests run natively.

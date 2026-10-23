@@ -23,7 +23,9 @@
 //!   twice, inputs up to [`MAX_INPUT_BYTES`], messages up to [`MAX_MESSAGE_BYTES`].
 //! - host → editor, in revision order: `snapshot {rev, generation, snapshot, discarded}` (the
 //!   workbook in GridCraft's native JSON; `discarded`: seqs of mutations the host dropped because
-//!   the workbook was replaced), `committed {rev, actor_label, ops}` (somebody else's change),
+//!   the workbook was replaced; the editor drops exactly those, says so, and sends every other
+//!   unconfirmed mutation again unchanged, keeping it on screen; an open cell editor stays),
+//!   `committed {rev, actor_label, ops}` (somebody else's change),
 //!   `ack {seq, rev}` (our mutation is durable as `rev`), `rejected {seq, code, current_rev,
 //!   cells:[{sheet?, cell, input, rev, actor_label}]}`, `online`, `offline`.
 use std::collections::BTreeMap;
@@ -212,8 +214,9 @@ pub enum Status {
 pub enum Effect {
     /// Send this message on the port.
     Post(Json),
-    /// Replace the document with the snapshot's workbook, then call [`Sync::loaded`].
-    Load { rev: u64, snapshot: Json },
+    /// Make the snapshot's workbook the document with `replay` (the unconfirmed edits the host
+    /// did not discard, in order) on top, then call [`Sync::loaded`].
+    Load { rev: u64, snapshot: Json, replay: Vec<RemoteOp> },
     /// Apply host-committed (or reconciled) cell values outside local history
     /// (`Session::apply_remote`).
     Apply { rev: u64, ops: Vec<RemoteOp> },
@@ -287,11 +290,18 @@ impl Sync {
         vec![Effect::Post(msg)]
     }
 
-    /// The snapshot from the last [`Effect::Load`] is now the document.
+    /// The snapshot from the last [`Effect::Load`] is now the document (with the edits still
+    /// pending on top). A cell editor that is open on a cell the snapshot left as it was counts
+    /// from the snapshot's revision; on a changed cell it keeps its start, so the host refuses
+    /// its commit as a conflict instead of overwriting the other writer's value.
     pub fn loaded(&mut self, rev: u64, inputs: BTreeMap<CellKey, String>) {
+        if let Some((k, start)) = &mut self.edit_start
+            && self.confirmed.get(k) == inputs.get(k)
+        {
+            *start = rev;
+        }
         self.confirmed = inputs;
         self.confirmed_rev = rev;
-        self.pending.clear();
         self.loaded = true;
     }
 
@@ -318,14 +328,22 @@ impl Sync {
     pub fn on_host(&mut self, msg: HostMsg) -> Vec<Effect> {
         match msg {
             HostMsg::Snapshot { rev, snapshot, discarded } => {
-                if self.loaded && (!discarded.is_empty() || !self.pending.is_empty()) {
-                    let n = discarded.len().max(self.pending.len());
-                    self.notice = Some(format!("the workbook was replaced: {n} unsaved change(s) discarded"));
+                // The host dropped exactly the mutations in `discarded` (it knows nothing of them
+                // any more). Every other unconfirmed one may not have reached it yet: it is sent
+                // again, byte for byte (the host deduplicates by seq), and stays on screen.
+                let (dropped, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending).into_iter().partition(|p| discarded.contains(&p.seq));
+                if self.loaded && !dropped.is_empty() {
+                    let lost: Vec<String> = dropped.iter().flat_map(|p| &p.ops).take(3).map(|o| o.cell.a1()).collect();
+                    self.notice = Some(format!("the workbook was reloaded: {} unsaved change(s) discarded ({})", dropped.len(), lost.join(", ")));
                 }
+                // A refusal is answered by the snapshot; the person's decision arrives as `committed`.
                 self.rejected = None;
-                self.pending.clear();
                 self.online = true;
-                vec![Effect::Load { rev, snapshot }]
+                let replay = kept.iter().flat_map(|p| p.ops.iter().cloned()).collect();
+                let mut effects = vec![Effect::Load { rev, snapshot, replay }];
+                effects.extend(kept.iter().map(|p| Effect::Post(p.message())));
+                self.pending = kept;
+                effects
             }
             HostMsg::Committed { rev, ops } => {
                 if rev <= self.confirmed_rev {
@@ -890,6 +908,32 @@ mod tests {
         assert!(s.notice.as_deref().unwrap().contains("1 unsaved change"));
         s.loaded(9, BTreeMap::new());
         assert_eq!((s.status(), s.confirmed_rev), (Status::Saved, 9));
+    }
+
+    #[test]
+    fn a_new_snapshot_resends_what_it_did_not_discard() {
+        let mut s = live(4);
+        let sent: Vec<Json> = [("B3", "1"), ("B4", "2"), ("B5", "3")]
+            .iter()
+            .flat_map(|(c, v)| posted(&s.local_edit(edit("cell.set", vec![op("Sheet1", c, v)]))))
+            .collect();
+        s.rejected = Some("conflict: B9".into());
+        let e = s.on_host(HostMsg::Snapshot { rev: 9, snapshot: json!({}), discarded: vec![2, 7] });
+        let Some(Effect::Load { rev: 9, replay, .. }) = e.first() else { panic!("{e:?}") };
+        // Seq 1 and 3 go on top of the snapshot, in order, and are restated byte for byte.
+        assert_eq!(*replay, [op("Sheet1", "B3", "1"), op("Sheet1", "B5", "3")]);
+        assert_eq!(posted(&e), [sent[0].clone(), sent[2].clone()]);
+        assert_eq!(s.pending.iter().map(|p| p.seq).collect::<Vec<_>>(), [1, 3]);
+        assert_eq!(s.rejected, None, "the snapshot answers a refusal");
+        assert!(s.notice.as_deref().unwrap().contains("1 unsaved change(s) discarded (B4)"), "{:?}", s.notice);
+        s.loaded(9, BTreeMap::new());
+        assert_eq!((s.status(), s.confirmed_rev, s.pending.len()), (Status::Saving, 9, 2));
+        // Nothing to drop: no notice.
+        let mut t = live(4);
+        let _ = t.local_edit(edit("cell.set", vec![op("Sheet1", "B3", "1")]));
+        let e = t.on_host(HostMsg::Snapshot { rev: 9, snapshot: json!({}), discarded: vec![] });
+        assert_eq!(posted(&e).len(), 1);
+        assert_eq!(t.notice, None);
     }
 
     #[test]
