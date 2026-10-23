@@ -118,7 +118,8 @@ pub fn load_snapshot(app: &mut SheetApp, rev: u64, snapshot: &Json, replay: &[Re
             target.insert(protocol::key(op), op.input.clone());
         }
     }
-    if !rebase(app, rev, &wb, &target) {
+    let replayed: BTreeSet<CellKey> = replay.iter().map(protocol::key).collect();
+    if !rebase(app, rev, &wb, &target, &replayed) {
         replace(app, rev, wb, replay);
     }
     let _ = app.session.take_local_ops();
@@ -128,8 +129,10 @@ pub fn load_snapshot(app: &mut SheetApp, rev: u64, snapshot: &Json, replay: &[Re
 
 /// Brings the open document to `target` (cell inputs) as one remote batch, keeping its history.
 /// False when the document differs from `wb` in more than cell contents, or the batch would not
-/// reproduce `target` exactly (then the caller replaces the document).
-fn rebase(app: &mut SheetApp, rev: u64, wb: &Workbook, target: &BTreeMap<CellKey, String>) -> bool {
+/// reproduce `target` exactly, or afterwards a cell outside `replayed` (the editor's own
+/// unconfirmed cells) or a row looks different from the snapshot's (a number format a local edit
+/// added, a hidden row, a row style): then the caller replaces the document.
+fn rebase(app: &mut SheetApp, rev: u64, wb: &Workbook, target: &BTreeMap<CellKey, String>, replayed: &BTreeSet<CellKey>) -> bool {
     let Some(d) = app.session.active_mut() else { return false };
     if shape(&d.wb) != shape(wb) {
         return false;
@@ -149,7 +152,39 @@ fn rebase(app: &mut SheetApp, rev: u64, wb: &Workbook, target: &BTreeMap<CellKey
     if !matches!(d.apply_remote(rev, &ops), Ok(true)) {
         return false;
     }
-    protocol::inputs_of(&d.wb) == *target
+    protocol::inputs_of(&d.wb) == *target && looks(&d.wb, replayed) == looks(wb, replayed)
+}
+
+/// What cell ops do not carry but a cell or row shows: the default style, each cell's style
+/// (resolved, so two style tables compare) unless it is the default or the cell is in `skip`,
+/// and each row's hidden, outline and style state and any height the user set (automatic heights
+/// follow content).
+fn looks(wb: &Workbook, skip: &BTreeSet<CellKey>) -> Json {
+    let default = wb.styles.get(gridcraft_engine::model::StyleId::DEFAULT);
+    let style = |id| {
+        let s = wb.styles.get(id);
+        (s != default).then(|| serde_json::to_value(s).unwrap_or(Json::Null))
+    };
+    let sheets: Vec<Json> = wb
+        .sheets
+        .iter()
+        .map(|sh| {
+            let cells: BTreeMap<String, Json> = sh
+                .cells
+                .iter()
+                .filter(|(c, _)| !skip.contains(&(sh.name.clone(), c.a1())))
+                .filter_map(|(c, cell)| Some((c.a1(), style(cell.style)?)))
+                .collect();
+            let rows: BTreeMap<u32, Json> = sh
+                .rows
+                .iter()
+                .map(|(r, l)| (*r, json!([l.hidden, l.outline, l.collapsed, l.custom.then_some(l.size).flatten(), l.style.and_then(style)])))
+                .filter(|(_, v)| *v != json!([false, 0, false, null, null]))
+                .collect();
+            json!({"name": sh.name, "cells": cells, "rows": rows})
+        })
+        .collect();
+    json!({"default": serde_json::to_value(default).unwrap_or(Json::Null), "sheets": sheets})
 }
 
 /// The workbook without what cell ops change or what is the view's own: cells, row heights
@@ -414,12 +449,18 @@ mod tests {
         assert_eq!(again, [sent[1].clone()]);
         assert_eq!(e.sync.pending.iter().map(|p| p.seq).collect::<Vec<_>>(), [2]);
         assert_eq!((e.input("B3").as_str(), e.input("B4").as_str()), ("host", "2"));
-        assert!(e.sync.notice.as_deref().unwrap().contains("1 unsaved change"), "{:?}", e.sync.notice);
+        assert_eq!(e.sync.discarded_notice().as_deref(), Some("the workbook was reloaded: 1 unsaved change(s) discarded: Sheet1!B3"));
+
         // A late answer for the dropped edit changes nothing.
         e.host(json!({"type": "ack", "protocol": 1, "seq": 1, "rev": 4}));
         assert_eq!(e.sync.pending.len(), 1);
         e.host(json!({"type": "ack", "protocol": 1, "seq": 2, "rev": 4}));
         assert_eq!((e.sync.status(), e.input("B3").as_str(), e.input("B4").as_str()), (Status::Saved, "host", "2"));
+        // The notice stays through later edits until the person dismisses it.
+        e.set("B6", "6");
+        assert!(e.sync.discarded_notice().is_some());
+        e.sync.dismiss_discarded();
+        assert_eq!(e.sync.discarded_notice(), None);
     }
 
     #[test]
@@ -437,6 +478,165 @@ mod tests {
         assert_eq!(e.editor(), Some(("B5".into(), "draft".into(), 3)));
         assert_eq!(e.input("B3"), "1");
         assert_eq!(of_type(&e.since(n), "mutation").len(), 1);
+        assert_eq!(e.undo_len(), 0);
+    }
+
+    // Review G2-F7: R1 (typing start vs. a snapshot), L1 (a discarded cell looks like the host's)
+    // and the paths checked without findings (undo of a discarded edit, two snapshots in a row,
+    // a multi-cell edit across a snapshot).
+
+    fn committed(rev: u64, cell: &str, input: &str) -> Json {
+        json!({"type": "committed", "protocol": 1, "rev": rev, "actor_label": "Other", "ops": [{"op": "cell.set", "sheet": "Sheet1", "cell": cell, "input": input}]})
+    }
+
+    /// Another writer changes the edited cell while the person types (a `committed`), then a
+    /// snapshot that does not change it again arrives. The commit must still be "unchanged since I
+    /// started typing" (base below the other writer's rev 2), not "since the snapshot".
+    #[test]
+    fn a_commit_by_another_writer_then_a_snapshot_keeps_the_typing_start() {
+        let mut e = Editor::new();
+        e.host(snapshot(1, &[("B2", "10")], &[]));
+        e.select("B5");
+        e.type_text("mine");
+        assert!(e.app.editor.is_some());
+        e.host(committed(2, "B5", "theirs"));
+        e.host(snapshot(3, &[("B2", "10"), ("B5", "theirs")], &[]));
+        assert_eq!(e.editor().map(|x| x.1), Some("mine".to_string()));
+        let n = e.posted.len();
+        e.keys(Key::Enter);
+        let m = of_type(&e.since(n), "mutation");
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert!(
+            m[0]["base_rev"].as_u64().unwrap() < 2,
+            "base_rev {} lets the server overwrite the other writer's B5 (rev 2) without a conflict",
+            m[0]["base_rev"]
+        );
+    }
+
+    /// The same without the snapshot: base_rev is the typing start (1).
+    #[test]
+    fn a_commit_by_another_writer_keeps_the_typing_start() {
+        let mut e = Editor::new();
+        e.host(snapshot(1, &[("B2", "10")], &[]));
+        e.select("B5");
+        e.type_text("mine");
+        e.host(committed(2, "B5", "theirs"));
+        let n = e.posted.len();
+        e.keys(Key::Enter);
+        let m = of_type(&e.since(n), "mutation");
+        assert_eq!(m[0]["base_rev"].as_u64(), Some(1));
+    }
+
+    /// Undo of an edit the host discarded writes nothing over the host's value.
+    #[test]
+    fn undo_after_a_discarded_edit_writes_nothing() {
+        let mut e = Editor::new();
+        e.host(snapshot(1, &[("B2", "10")], &[]));
+        e.set("B3", "1");
+        e.host(snapshot(3, &[("B2", "10"), ("B3", "host")], &[1]));
+        assert_eq!(e.input("B3"), "host");
+        let n = e.posted.len();
+        e.app.session.run("edit.undo", json!({})).unwrap();
+        e.frames(2);
+        assert_eq!(e.input("B3"), "host");
+        assert!(of_type(&e.since(n), "mutation").is_empty());
+    }
+
+    /// Two snapshots in one frame: the first keeps seq 1 (sent again), the second discards it.
+    #[test]
+    fn two_snapshots_in_a_row_keep_then_drop() {
+        let mut e = Editor::new();
+        e.host(snapshot(1, &[("B2", "10")], &[]));
+        e.set("B3", "1");
+        let n = e.posted.len();
+        e.frame(vec![], vec![snapshot(3, &[("B2", "10")], &[]), snapshot(4, &[("B2", "10"), ("B3", "host")], &[1])]);
+        e.frames(2);
+        assert_eq!(of_type(&e.since(n), "mutation").len(), 1);
+        assert!(e.sync.pending.is_empty());
+        assert_eq!(e.input("B3"), "host");
+        assert!(e.sync.discarded_notice().unwrap_or_default().contains("discarded: Sheet1!B3"), "{:?}", e.sync.discarded_notice());
+        assert_eq!(e.sync.status(), Status::Saved);
+        // A late ack for the dropped seq changes nothing.
+        e.host(json!({"type": "ack", "protocol": 1, "seq": 1, "rev": 5}));
+        assert_eq!(e.input("B3"), "host");
+    }
+
+    /// A multi-cell edit (fill down, 3 cells, one mutation) survives a snapshot, is sent again
+    /// byte for byte, and undo afterwards takes back exactly its cells.
+    #[test]
+    fn a_multi_cell_edit_survives_a_snapshot_and_undoes() {
+        let mut e = Editor::new();
+        e.host(snapshot(1, &[("A1", "1")], &[]));
+        e.app.session.run("selection.set", json!({"range": "A1:A4"})).unwrap();
+        e.frames(1);
+        e.app.session.run("edit.fillDown", json!({})).unwrap();
+        e.frames(2);
+        let sent = of_type(&e.posted, "mutation");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["ops"].as_array().unwrap().len(), 3);
+        let n = e.posted.len();
+        e.host(snapshot(3, &[("A1", "1"), ("C1", "theirs")], &[]));
+        let again = of_type(&e.since(n), "mutation");
+        assert_eq!(again.iter().map(Json::to_string).collect::<Vec<_>>(), [sent[0].to_string()]);
+        assert_eq!((e.input("A2").as_str(), e.input("A4").as_str(), e.input("C1").as_str()), ("1", "1", "theirs"));
+        let n = e.posted.len();
+        e.app.session.run("edit.undo", json!({})).unwrap();
+        e.frames(2);
+        let undo = of_type(&e.since(n), "mutation");
+        assert_eq!(undo.len(), 1);
+        assert_eq!(undo[0]["ops"].as_array().unwrap().len(), 3);
+        assert_eq!((e.input("A2").as_str(), e.input("C1").as_str()), ("", "theirs"));
+    }
+
+    /// After a discarded edit of a formatted input, the rebased cell looks like the host's
+    /// (not only the same input): compare the cell JSON with a fresh load of the same snapshot.
+    #[test]
+    fn a_discarded_percent_shows_the_hosts_cell() {
+        let mut e = Editor::new();
+        e.host(snapshot(1, &[("B2", "10")], &[]));
+        e.set("B3", "50%");
+        let snap = snapshot(3, &[("B2", "10"), ("B3", "5")], &[1]);
+        let fresh = protocol::workbook_from_snapshot(&snap["snapshot"]).unwrap();
+        e.host(snap);
+        let d = e.app.session.active().unwrap();
+        let cell_json = |wb: &Workbook| serde_json::to_value(wb).unwrap()["sheets"][0]["cells"].to_string();
+        assert_eq!(cell_json(&d.wb), cell_json(&fresh), "the editor's B3 differs from the host's snapshot B3");
+        assert_eq!(e.input("B3"), "5");
+    }
+
+    /// A kept (resent) formatted edit keeps its own look, and the reload keeps the undo history:
+    /// only cells outside the editor's unconfirmed ones are compared.
+    #[test]
+    fn a_kept_percent_keeps_its_format_and_the_history() {
+        let mut e = Editor::new();
+        e.host(snapshot(1, &[("B2", "10")], &[]));
+        e.set("B3", "50%");
+        let undo = e.undo_len();
+        let style = |e: &Editor| e.app.session.active().unwrap().wb.sheet(0).unwrap().cells.iter().find(|(c, _)| c.a1() == "B3").unwrap().1.style;
+        let (before, input) = (style(&e), e.input("B3"));
+        e.host(snapshot(3, &[("B2", "10"), ("C1", "theirs")], &[]));
+        assert_eq!((e.input("B3"), e.input("C1").as_str()), (input, "theirs"));
+        assert_eq!(e.undo_len(), undo);
+        assert_ne!(style(&e), gridcraft_engine::model::StyleId::DEFAULT);
+        assert_eq!(style(&e), before);
+    }
+
+    /// A snapshot that hides a row (not expressible as a cell op) replaces the document: the
+    /// editor shows the host's row, not its own.
+    #[test]
+    fn a_snapshot_with_a_hidden_row_replaces_the_document() {
+        let mut e = Editor::new();
+        e.host(snapshot(1, &[("B2", "10")], &[]));
+        e.set("B3", "1");
+        let mut s = snapshot(3, &[("B2", "10")], &[]);
+        let wb = &mut s["snapshot"];
+        let mut sheet: gridcraft_engine::model::Sheet = serde_json::from_value(wb["sheets"][0].clone()).unwrap();
+        sheet.rows.entry(3).or_default().hidden = true;
+        wb["sheets"][0] = serde_json::to_value(&sheet).unwrap();
+        e.host(s);
+        let d = e.app.session.active().unwrap();
+        assert!(d.wb.sheet(0).unwrap().rows.get(&3).is_some_and(|l| l.hidden), "row 4 hidden as the host has it");
+        assert_eq!(e.input("B3"), "1", "the unconfirmed edit stays");
         assert_eq!(e.undo_len(), 0);
     }
 }

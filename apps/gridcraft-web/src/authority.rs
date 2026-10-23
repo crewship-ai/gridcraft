@@ -162,7 +162,7 @@ impl Authority {
         }
     }
 
-    fn draw_status(&self, ctx: &egui::Context, status: &Status) {
+    fn draw_status(&mut self, ctx: &egui::Context, status: &Status) {
         let (mut text, color) = match status {
             Status::Connecting => ("Connecting…".to_string(), egui::Color32::GRAY),
             Status::Saved => (format!("Saved · rev {}", self.sync.confirmed_rev), egui::Color32::from_rgb(0x1e, 0x7b, 0x34)),
@@ -173,14 +173,29 @@ impl Authority {
         if let Some(n) = &self.sync.notice {
             text = format!("{text} · {n}");
         }
-        egui::Area::new(egui::Id::new("host_authority_status")).anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-8.0, -30.0)).interactable(false).show(
-            ctx,
-            |ui| {
+        // Discarded edits stay on screen until the person dismisses them.
+        let discarded = self.sync.discarded_notice();
+        let mut dismiss = false;
+        egui::Area::new(egui::Id::new("host_authority_status"))
+            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-8.0, -30.0))
+            .interactable(discarded.is_some())
+            .show(ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    if let Some(d) = &discarded {
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(d).color(egui::Color32::from_rgb(0xc0, 0x1c, 0x1c)))
+                                    .wrap_mode(egui::TextWrapMode::Extend),
+                            );
+                            dismiss = ui.small_button("Dismiss").clicked();
+                        });
+                    }
                     ui.add(egui::Label::new(egui::RichText::new(text).color(color)).wrap_mode(egui::TextWrapMode::Extend));
                 });
-            },
-        );
+            });
+        if dismiss {
+            self.sync.dismiss_discarded();
+        }
     }
 
     /// Test-only state report into the editor's own document (see the module docs).
@@ -201,7 +216,8 @@ impl Authority {
         let editor = app.editor.as_ref().map(|e| json!({"cell": e.cell.a1(), "text": e.text, "caret": e.caret}));
         let state = json!({
             "status": format!("{status:?}"),
-            "notice": self.sync.notice,
+            "notice": self.sync.notices(),
+            "discarded": self.sync.discarded_notice(),
             "rev": self.sync.confirmed_rev,
             "pending": self.sync.pending.len(),
             "cells": first,

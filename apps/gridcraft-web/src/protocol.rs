@@ -23,7 +23,7 @@
 //!   twice, inputs up to [`MAX_INPUT_BYTES`], messages up to [`MAX_MESSAGE_BYTES`].
 //! - host → editor, in revision order: `snapshot {rev, generation, snapshot, discarded}` (the
 //!   workbook in GridCraft's native JSON; `discarded`: seqs of mutations the host dropped because
-//!   the workbook was replaced; the editor drops exactly those, says so, and sends every other
+//!   the workbook was replaced; the editor drops exactly those, says so until dismissed, and sends every other
 //!   unconfirmed mutation again unchanged, keeping it on screen; an open cell editor stays),
 //!   `committed {rev, actor_label, ops}` (somebody else's change),
 //!   `ack {seq, rev}` (our mutation is durable as `rev`), `rejected {seq, code, current_rev,
@@ -237,11 +237,37 @@ pub struct Sync {
     pub rejected: Option<String>,
     /// A local command that was refused or only partly shared; shown until the next edit.
     pub notice: Option<String>,
-    /// The cell being edited and the confirmed revision when its editor opened: the commit's
-    /// precondition is "unchanged since I started typing", not "since I pressed Enter".
-    edit_start: Option<(CellKey, u64)>,
+    /// Edits a host snapshot discarded: how many mutations and which cells, in order without
+    /// repeats. Shown until the person dismisses it ([`Sync::dismiss_discarded`]).
+    discarded: (usize, Vec<CellKey>),
+    /// The open cell editor's precondition: "unchanged since I started typing", not "since I
+    /// pressed Enter".
+    edit_start: Option<EditStart>,
     /// The open drafts the host last heard of (it assumes none until told).
     drafts_sent: Vec<CellKey>,
+}
+
+/// Where an open cell editor started: its cell, the confirmed revision then, the confirmed input
+/// of that cell then, and whether a confirmed change of that cell (another writer's commit, a
+/// refusal naming it, our own ack) arrived since.
+#[derive(Clone, Debug, PartialEq)]
+struct EditStart {
+    cell: CellKey,
+    rev: u64,
+    input: Option<String>,
+    touched: bool,
+}
+
+/// Most cell addresses the discarded-edits notice names; the rest are counted.
+pub const MAX_NOTICE_CELLS: usize = 5;
+
+/// `Sheet1!B3`, or `'My sheet'!B3` when the name needs quoting.
+fn a1_with_sheet((sheet, cell): &CellKey) -> String {
+    if !sheet.is_empty() && sheet.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        format!("{sheet}!{cell}")
+    } else {
+        format!("'{}'!{cell}", sheet.replace('\'', "''"))
+    }
 }
 
 impl Sync {
@@ -265,10 +291,46 @@ impl Sync {
     /// The cell the user is editing now (each frame).
     pub fn editing(&mut self, cell: Option<CellKey>) {
         match cell {
-            Some(k) if self.edit_start.as_ref().is_none_or(|(e, _)| *e != k) => self.edit_start = Some((k, self.confirmed_rev)),
+            Some(k) if self.edit_start.as_ref().is_none_or(|e| e.cell != k) => {
+                let input = self.confirmed.get(&k).cloned();
+                self.edit_start = Some(EditStart { cell: k, rev: self.confirmed_rev, input, touched: false });
+            }
             None => self.edit_start = None,
             _ => {}
         }
+    }
+
+    /// A confirmed value of `cell` changed while its editor may be open.
+    fn touch(&mut self, cell: &CellKey) {
+        if let Some(e) = &mut self.edit_start
+            && e.cell == *cell
+        {
+            e.touched = true;
+        }
+    }
+
+    /// The discarded-edits notice: kept until [`Sync::dismiss_discarded`]; names at most
+    /// [`MAX_NOTICE_CELLS`] cells as `sheet!cell` and counts the rest.
+    pub fn discarded_notice(&self) -> Option<String> {
+        let (n, cells) = &self.discarded;
+        if *n == 0 {
+            return None;
+        }
+        let named: Vec<String> = cells.iter().take(MAX_NOTICE_CELLS).map(a1_with_sheet).collect();
+        let more = cells.len().saturating_sub(MAX_NOTICE_CELLS);
+        let more = if more > 0 { format!(" +{more} more") } else { String::new() };
+        Some(format!("the workbook was reloaded: {n} unsaved change(s) discarded: {}{more}", named.join(", ")))
+    }
+
+    /// The person has seen the discarded-edits notice.
+    pub fn dismiss_discarded(&mut self) {
+        self.discarded = (0, vec![]);
+    }
+
+    /// Every notice now, the discarded edits first.
+    pub fn notices(&self) -> Option<String> {
+        let all: Vec<String> = self.discarded_notice().into_iter().chain(self.notice.clone()).collect();
+        (!all.is_empty()).then(|| all.join(" · "))
     }
 
     /// The cells with an open, uncommitted cell editor now (each frame; addresses only, never
@@ -291,14 +353,16 @@ impl Sync {
     }
 
     /// The snapshot from the last [`Effect::Load`] is now the document (with the edits still
-    /// pending on top). A cell editor that is open on a cell the snapshot left as it was counts
-    /// from the snapshot's revision; on a changed cell it keeps its start, so the host refuses
-    /// its commit as a conflict instead of overwriting the other writer's value.
+    /// pending on top). A cell editor open on a cell that nobody changed since it opened (no
+    /// confirmed change of it arrived, and the snapshot still has the input it had then) counts
+    /// from the snapshot's revision. Otherwise it keeps its start, so the host refuses its commit
+    /// as a conflict instead of overwriting the other writer's value.
     pub fn loaded(&mut self, rev: u64, inputs: BTreeMap<CellKey, String>) {
-        if let Some((k, start)) = &mut self.edit_start
-            && self.confirmed.get(k) == inputs.get(k)
+        if let Some(e) = &mut self.edit_start
+            && !e.touched
+            && e.input.as_ref() == inputs.get(&e.cell)
         {
-            *start = rev;
+            e.rev = rev;
         }
         self.confirmed = inputs;
         self.confirmed_rev = rev;
@@ -333,8 +397,12 @@ impl Sync {
                 // again, byte for byte (the host deduplicates by seq), and stays on screen.
                 let (dropped, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending).into_iter().partition(|p| discarded.contains(&p.seq));
                 if self.loaded && !dropped.is_empty() {
-                    let lost: Vec<String> = dropped.iter().flat_map(|p| &p.ops).take(3).map(|o| o.cell.a1()).collect();
-                    self.notice = Some(format!("the workbook was reloaded: {} unsaved change(s) discarded ({})", dropped.len(), lost.join(", ")));
+                    self.discarded.0 += dropped.len();
+                    for k in dropped.iter().flat_map(|p| p.ops.iter().map(key)) {
+                        if !self.discarded.1.contains(&k) {
+                            self.discarded.1.push(k);
+                        }
+                    }
                 }
                 // A refusal is answered by the snapshot; the person's decision arrives as `committed`.
                 self.rejected = None;
@@ -355,6 +423,7 @@ impl Sync {
                 let pending = self.pending_cells();
                 let mut apply = vec![];
                 for op in ops {
+                    self.touch(&key(&op));
                     self.confirmed.insert(key(&op), op.input.clone());
                     // A cell with an unacknowledged local change keeps showing it until the host
                     // decides (it rejects ours if they conflict).
@@ -369,6 +438,7 @@ impl Sync {
                 let Some(i) = self.pending.iter().position(|p| p.seq == seq) else { return vec![] };
                 let p = self.pending.remove(i);
                 for op in &p.ops {
+                    self.touch(&key(op));
                     self.confirmed.insert(key(op), op.input.clone());
                 }
                 if rev == self.confirmed_rev + 1 {
@@ -387,7 +457,9 @@ impl Sync {
                     // The host names the sheet when it knows it; otherwise it is the sheet of our op on that cell.
                     let sheet = c.sheet.or_else(|| p.ops.iter().find(|o| o.cell.a1() == c.cell).map(|o| o.sheet.clone()));
                     if let Some(sheet) = sheet {
-                        self.confirmed.insert((sheet, c.cell), c.input);
+                        let k = (sheet, c.cell);
+                        self.touch(&k);
+                        self.confirmed.insert(k, c.input);
                     }
                 }
                 let still = self.pending_cells();
@@ -451,7 +523,7 @@ impl Sync {
             self.rejected = None;
         }
         let base_rev = match &self.edit_start {
-            Some((k, rev)) if ops.iter().any(|o| key(o) == *k) => (*rev).min(self.confirmed_rev),
+            Some(e) if ops.iter().any(|o| key(o) == e.cell) => e.rev.min(self.confirmed_rev),
             _ => self.confirmed_rev,
         };
         // Within the host's limits: at most MAX_OPS ops and one message's worth of bytes each.
@@ -905,7 +977,7 @@ mod tests {
         let e = s.on_host(HostMsg::Snapshot { rev: 9, snapshot: json!({"sheets": []}), discarded: vec![1] });
         assert!(matches!(e.as_slice(), [Effect::Load { rev: 9, .. }]));
         assert!(s.pending.is_empty());
-        assert!(s.notice.as_deref().unwrap().contains("1 unsaved change"));
+        assert_eq!(s.discarded_notice().as_deref(), Some("the workbook was reloaded: 1 unsaved change(s) discarded: Sheet1!B3"));
         s.loaded(9, BTreeMap::new());
         assert_eq!((s.status(), s.confirmed_rev), (Status::Saved, 9));
     }
@@ -925,7 +997,7 @@ mod tests {
         assert_eq!(posted(&e), [sent[0].clone(), sent[2].clone()]);
         assert_eq!(s.pending.iter().map(|p| p.seq).collect::<Vec<_>>(), [1, 3]);
         assert_eq!(s.rejected, None, "the snapshot answers a refusal");
-        assert!(s.notice.as_deref().unwrap().contains("1 unsaved change(s) discarded (B4)"), "{:?}", s.notice);
+        assert_eq!(s.discarded_notice().as_deref(), Some("the workbook was reloaded: 1 unsaved change(s) discarded: Sheet1!B4"));
         s.loaded(9, BTreeMap::new());
         assert_eq!((s.status(), s.confirmed_rev, s.pending.len()), (Status::Saving, 9, 2));
         // Nothing to drop: no notice.
@@ -933,7 +1005,7 @@ mod tests {
         let _ = t.local_edit(edit("cell.set", vec![op("Sheet1", "B3", "1")]));
         let e = t.on_host(HostMsg::Snapshot { rev: 9, snapshot: json!({}), discarded: vec![] });
         assert_eq!(posted(&e).len(), 1);
-        assert_eq!(t.notice, None);
+        assert_eq!((t.notice.as_ref(), t.discarded_notice()), (None, None));
     }
 
     #[test]
@@ -948,5 +1020,91 @@ mod tests {
         assert_eq!(inputs[&("Sheet1".into(), "B2".into())], "10");
         assert_eq!(inputs[&("Sheet1".into(), "B3".into())], "=B2*2");
         assert!(workbook_from_snapshot(&json!({"cells": {"A1": "x"}})).is_err());
+    }
+
+    /// Typing in B5 since rev 1; then `between` reaches the editor; then a snapshot at rev 3 with
+    /// `b5` as B5 (and B2 = 10). Returns the base_rev of the B5 commit.
+    fn base_after_snapshot(between: Vec<HostMsg>, b5: Option<&str>) -> u64 {
+        let mut s = live(1);
+        s.editing(Some(k("Sheet1", "B5")));
+        for m in between {
+            let _ = s.on_host(m);
+        }
+        let _ = s.on_host(HostMsg::Snapshot { rev: 3, snapshot: json!({}), discarded: vec![] });
+        let mut inputs = BTreeMap::from([(k("Sheet1", "B2"), "10".to_string())]);
+        if let Some(v) = b5 {
+            inputs.insert(k("Sheet1", "B5"), v.to_string());
+        }
+        s.loaded(3, inputs);
+        s.editing(Some(k("Sheet1", "B5")));
+        let m = posted(&s.local_edit(edit("cell.set", vec![op("Sheet1", "B5", "mine")])));
+        m[0]["base_rev"].as_u64().unwrap()
+    }
+
+    /// R1 (review G2-F7): the typing start moves to a snapshot's revision only when nobody changed
+    /// the cell since typing began: not when another writer's commit to it arrived in between
+    /// (even if the snapshot agrees with that commit, or puts the old input back), and not when the
+    /// snapshot itself has another input there.
+    #[test]
+    fn a_snapshot_moves_the_typing_start_only_for_an_untouched_cell() {
+        let theirs = || HostMsg::Committed { rev: 2, ops: vec![op("Sheet1", "B5", "theirs")] };
+        // Untouched and unchanged: counts from the snapshot (the host would refuse an old base).
+        assert_eq!(base_after_snapshot(vec![], None), 3);
+        // Another writer's B5 during typing, the snapshot agrees with it: still rev 1, a conflict.
+        assert_eq!(base_after_snapshot(vec![theirs()], Some("theirs")), 1);
+        // ...or the snapshot shows B5 empty again (as at typing start): still rev 1.
+        assert_eq!(base_after_snapshot(vec![theirs()], None), 1);
+        // A change the editor never saw (a revision gap, then the snapshot): rev 1.
+        assert_eq!(base_after_snapshot(vec![], Some("theirs")), 1);
+        // A refusal naming B5 carries the host's B5: touched as well.
+        let mut s = live(1);
+        let _ = s.local_edit(edit("cell.set", vec![op("Sheet1", "C1", "x")]));
+        s.editing(Some(k("Sheet1", "B5")));
+        let _ = s.on_host(HostMsg::Rejected {
+            seq: 1,
+            code: "conflict".into(),
+            cells: vec![Conflict { sheet: Some("Sheet1".into()), cell: "B5".into(), input: "".into() }],
+        });
+        let _ = s.on_host(HostMsg::Snapshot { rev: 3, snapshot: json!({}), discarded: vec![] });
+        s.loaded(3, BTreeMap::new());
+        let m = posted(&s.local_edit(edit("cell.set", vec![op("Sheet1", "B5", "mine")])));
+        assert_eq!(m[0]["base_rev"].as_u64(), Some(1));
+        // Another cell's commit does not count against B5.
+        let other = HostMsg::Committed { rev: 2, ops: vec![op("Sheet1", "C9", "c")] };
+        assert_eq!(base_after_snapshot(vec![other], None), 3);
+    }
+
+    /// L2 (review G2-F7): the discarded-edits notice stays through later edits until dismissed,
+    /// names cells with their sheet, at most [`MAX_NOTICE_CELLS`], and counts the rest; a second
+    /// snapshot adds to it.
+    #[test]
+    fn the_discarded_notice_stays_until_dismissed() {
+        let mut s = live(4);
+        let cells = ["A1", "A2", "A3", "A4", "A5", "A6"];
+        let _ = s.local_edit(edit("cell.set", cells.iter().map(|c| op("Sheet1", c, "1")).collect()));
+        let _ = s.local_edit(edit("cell.set", vec![op("My sheet", "B1", "2")]));
+        let _ = s.on_host(HostMsg::Snapshot { rev: 9, snapshot: json!({}), discarded: vec![1, 2] });
+        s.loaded(9, BTreeMap::new());
+        let want = "the workbook was reloaded: 2 unsaved change(s) discarded: Sheet1!A1, Sheet1!A2, Sheet1!A3, Sheet1!A4, Sheet1!A5 +2 more";
+        assert_eq!(s.discarded_notice().as_deref(), Some(want));
+        // A later edit (with its own notice) does not hide it.
+        let partial =
+            LocalEdit { command: "edit.paste".into(), ops: vec![op("Sheet1", "C1", "c")], complete: false, structural: false, undo_step: true };
+        let _ = s.local_edit(partial);
+        assert_eq!(s.discarded_notice().as_deref(), Some(want));
+        assert_eq!(s.notices().unwrap(), format!("{want} · edit.paste: only cell contents are shared"));
+        // A second snapshot adds what it discards.
+        let _ = s.on_host(HostMsg::Snapshot { rev: 11, snapshot: json!({}), discarded: vec![3] });
+        assert!(
+            s.discarded_notice().unwrap().starts_with("the workbook was reloaded: 3 unsaved change(s) discarded: "),
+            "{:?}",
+            s.discarded_notice()
+        );
+        assert!(s.discarded_notice().unwrap().ends_with(" +3 more"), "{:?}", s.discarded_notice());
+        s.dismiss_discarded();
+        assert_eq!(s.discarded_notice(), None);
+        assert_eq!(s.notices().as_deref(), Some("edit.paste: only cell contents are shared"));
+        assert_eq!(a1_with_sheet(&k("My sheet", "B1")), "'My sheet'!B1");
+        assert_eq!(a1_with_sheet(&k("O'Neil", "B1")), "'O''Neil'!B1");
     }
 }
