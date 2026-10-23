@@ -73,6 +73,7 @@ pub fn start() {
                     } else {
                         None
                     };
+                    app.session.host_cells_only = authority_mode;
                     if let Some(a) = &authority {
                         a.connect(cc.egui_ctx.clone());
                     }
@@ -110,6 +111,10 @@ struct WebShell {
 impl eframe::App for WebShell {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let dropped = ctx.input_mut(|i| std::mem::take(&mut i.raw.dropped_files));
+        if self.authority.is_some() && !dropped.is_empty() {
+            self.app.message = Some(("Import unavailable".into(), gridcraft_engine::host_policy::UNSUPPORTED.into()));
+            return;
+        }
         for f in dropped {
             let inbox = self.inbox.clone();
             let ctx = ctx.clone();

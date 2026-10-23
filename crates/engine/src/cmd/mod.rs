@@ -60,7 +60,7 @@ pub struct CommandInfo {
 
 impl CommandSpec {
     pub fn info(&self, s: &Session) -> CommandInfo {
-        let e = (self.enabled)(s);
+        let e = s.check_host_command(self.id, None).and_then(|()| (self.enabled)(s));
         CommandInfo {
             id: self.id,
             label: self.label,

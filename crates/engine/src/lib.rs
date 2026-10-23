@@ -12,6 +12,7 @@ mod clip_html;
 pub mod cmd;
 pub mod display;
 pub mod fill;
+pub mod host_policy;
 pub mod io;
 pub mod links;
 pub mod outline;
@@ -275,6 +276,8 @@ pub struct Session {
     /// Collect a [`remote::LocalEdit`] for every top-level command that changed the workbook
     /// (a host-authority embedding sends them as mutations). Off by default.
     pub record_local_ops: bool,
+    /// Restrict a hosted editor to operations its cell protocol can persist.
+    pub host_cells_only: bool,
     local_ops: Vec<remote::LocalEdit>,
     /// Nesting depth of `execute` (commands that run other commands).
     depth: u32,
@@ -338,6 +341,7 @@ impl Session {
     /// Runs a command by id. Undoable commands record a history step when the workbook changed.
     /// Panics inside commands are caught and reported; the workbook is restored.
     pub fn execute(&mut self, id: &str, params: Json) -> Result<Json> {
+        self.check_host_command(id, Some(&params)).map_err(|why| EngineError::Disabled(id.into(), why))?;
         let spec = find_command(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
         if let Err(why) = (spec.enabled)(self) {
             return Err(EngineError::Disabled(id.to_string(), why));

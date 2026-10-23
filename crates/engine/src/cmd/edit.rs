@@ -817,6 +817,13 @@ enum What {
 }
 
 fn paste(s: &mut Session, p: &Json) -> Result<Json> {
+    // Hosted plain text must never be upgraded to a rich internal copy just
+    // because it matches the clipboard text. Only cell inputs travel to the host.
+    if s.host_cells_only
+        && let Some(text) = str_param(p, "text")
+    {
+        return paste_text(s, p, text);
+    }
     // External text (from the system clipboard) when it differs from ours.
     if let Some(text) = str_param(p, "text")
         && s.clipboard.as_ref().is_none_or(|c| c.text.trim_end_matches(['\r', '\n']) != text.trim_end_matches(['\r', '\n']))
@@ -1261,6 +1268,7 @@ pub(crate) fn rewrite_all_formulas(wb: &mut gridcraft_model::Workbook, target: &
 // ---------------------------------------------------------------- clear
 
 fn clear(s: &mut Session, p: &Json, what: &str) -> Result<Json> {
+    let host_cells_only = s.host_cells_only;
     let sheet = target_sheet(s, p)?;
     let ranges = target_ranges(s, p)?;
     // Delete on checkboxes works in two passes (as in Excel): checked boxes are unchecked first,
@@ -1298,7 +1306,7 @@ fn clear(s: &mut Session, p: &Json, what: &str) -> Result<Json> {
                         cell.value = Value::Bool(false);
                     } else {
                         cell.value = Value::Empty;
-                        if checkbox {
+                        if checkbox && !host_cells_only {
                             cell.style = cx.wb.styles.derive(cell.style, |st| st.num_fmt = gridcraft_model::NumFmt::new("General"));
                         }
                     }
