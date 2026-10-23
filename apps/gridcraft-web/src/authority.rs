@@ -18,6 +18,9 @@
 //!   have.
 //! - Host commits apply through `Session::apply_remote`: not undoable by the local user, the
 //!   redo stack, the selection and an open cell editor are untouched.
+//! - The open cell editor is reported as a `draft` (its address only, never its text) whenever
+//!   it opens, moves to another cell, commits or is cancelled, so the host can warn about another
+//!   writer's change to that cell.
 //! - "Saved" only when every mutation has an ack (sent once the host made the commit durable).
 //!   A rejection shows the host's value again and "Not saved".
 //!
@@ -160,7 +163,7 @@ impl Authority {
             let sheet = app.session.active()?.wb.sheets.get(ed.sheet)?.name.clone();
             Some((sheet, ed.cell.a1()))
         });
-        self.sync.editing(editing);
+        self.sync.editing(editing.clone());
         loop {
             let next = self.shared.borrow_mut().inbound.pop_front();
             let Some(text) = next else { break };
@@ -172,6 +175,10 @@ impl Authority {
                 Err(e) => log::warn!("host message ignored: {e}"),
             }
         }
+        // Which cell has an open, uncommitted editor (its address, never its text): the host
+        // hears of each change once, after any commit this frame sent.
+        let effects = self.sync.drafts(editing);
+        self.run(app, effects);
         let status = self.sync.status();
         if let Some(d) = app.session.active_mut() {
             // The unsaved-changes flag follows host acks, never "handed over".

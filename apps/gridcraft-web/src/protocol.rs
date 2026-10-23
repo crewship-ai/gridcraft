@@ -16,7 +16,9 @@
 //!
 //! On the port, every message is a JSON string with `protocol: 1`:
 //! - editor → host: `mutation {seq, base_rev, ops:[{op:"cell.set", sheet, cell, input}]}` and
-//!   `resume {last_rev, pending:[{seq, base_rev, ops}]}`. `seq` is positive and increasing; a
+//!   `resume {last_rev, pending:[{seq, base_rev, ops}]}`, and `draft {cells:[{sheet, cell}]}`: the
+//!   cells with an open, uncommitted cell editor (addresses only, never what is typed; empty when
+//!   none), sent after the snapshot loaded and only when that set changes. `seq` is positive and increasing; a
 //!   restatement repeats a mutation byte for byte. At most [`MAX_OPS`] ops per mutation, no cell
 //!   twice, inputs up to [`MAX_INPUT_BYTES`], messages up to [`MAX_MESSAGE_BYTES`].
 //! - host → editor, in revision order: `snapshot {rev, generation, snapshot, discarded}` (the
@@ -171,6 +173,27 @@ impl Pending {
     }
 }
 
+/// Most cells one `draft` names (the host takes as many as one mutation's ops).
+pub const MAX_DRAFT_CELLS: usize = MAX_OPS;
+
+/// A sheet name the host takes: 1 to [`MAX_SHEET_CHARS`] UTF-16 units (JavaScript's length).
+fn host_sheet(sheet: &str) -> bool {
+    !sheet.is_empty() && sheet.encode_utf16().count() <= MAX_SHEET_CHARS
+}
+
+/// An A1 address as the host checks it: `^[A-Z]{1,3}[1-9][0-9]{0,6}$`.
+fn host_cell(cell: &str) -> bool {
+    let letters = cell.bytes().take_while(u8::is_ascii_uppercase).count();
+    let digits = &cell.as_bytes()[letters..];
+    (1..=3).contains(&letters) && (1..=7).contains(&digits.len()) && digits.first() != Some(&b'0') && digits.iter().all(u8::is_ascii_digit)
+}
+
+/// `draft {cells:[{sheet, cell}]}`: the cells with an open, uncommitted cell editor; empty when none.
+pub fn draft_message(cells: &[CellKey]) -> Json {
+    let cells: Vec<Json> = cells.iter().map(|(sheet, cell)| json!({"sheet": sheet, "cell": cell})).collect();
+    json!({"type": "draft", "protocol": PROTOCOL, "cells": cells})
+}
+
 fn op_bytes(op: &RemoteOp) -> usize {
     json!({"op": "cell.set", "sheet": op.sheet, "cell": op.cell.a1(), "input": op.input}).to_string().len() + 1
 }
@@ -214,6 +237,8 @@ pub struct Sync {
     /// The cell being edited and the confirmed revision when its editor opened: the commit's
     /// precondition is "unchanged since I started typing", not "since I pressed Enter".
     edit_start: Option<(CellKey, u64)>,
+    /// The open drafts the host last heard of (it assumes none until told).
+    drafts_sent: Vec<CellKey>,
 }
 
 impl Sync {
@@ -241,6 +266,25 @@ impl Sync {
             None => self.edit_start = None,
             _ => {}
         }
+    }
+
+    /// The cells with an open, uncommitted cell editor now (each frame; addresses only, never
+    /// what is typed). Posts `draft` with the whole set when it differs from the set the host last
+    /// heard, which starts empty: one message per change, none while typing into the same cell,
+    /// none before the snapshot is the document. The set is sorted, without repeats, without
+    /// addresses the host would refuse, and at most [`MAX_DRAFT_CELLS`] long.
+    pub fn drafts(&mut self, cells: impl IntoIterator<Item = CellKey>) -> Vec<Effect> {
+        if !self.loaded {
+            return vec![];
+        }
+        let set: std::collections::BTreeSet<CellKey> = cells.into_iter().filter(|(sheet, cell)| host_sheet(sheet) && host_cell(cell)).collect();
+        let set: Vec<CellKey> = set.into_iter().take(MAX_DRAFT_CELLS).collect();
+        if set == self.drafts_sent {
+            return vec![];
+        }
+        let msg = draft_message(&set);
+        self.drafts_sent = set;
+        vec![Effect::Post(msg)]
     }
 
     /// The snapshot from the last [`Effect::Load`] is now the document.
@@ -470,6 +514,122 @@ mod tests {
             assert!(o["input"].as_str().unwrap().len() <= MAX_INPUT_BYTES);
             assert!(cells.insert((o["sheet"].as_str().unwrap().to_string(), cell.to_string())), "a cell twice");
         }
+    }
+
+    /// The host's checks for a `draft` message (`parseFrameMessage` in the host bridge): exactly
+    /// {type, protocol, cells}, at most `BRIDGE_MAX_OPS` cells of exactly {sheet, cell}, a sheet of
+    /// 1..=128 UTF-16 units, a cell matching `^[A-Z]{1,3}[1-9][0-9]{0,6}$`. Returns the addresses.
+    fn host_accepts_draft(m: &Json) -> Vec<(String, String)> {
+        assert_eq!(keys(m), ["cells", "protocol", "type"]);
+        assert_eq!((m["type"].as_str(), m["protocol"].as_u64()), (Some("draft"), Some(1)));
+        assert!(m.to_string().len() <= MAX_MESSAGE_BYTES);
+        let cells = m["cells"].as_array().unwrap();
+        assert!(cells.len() <= MAX_OPS);
+        let mut out = vec![];
+        for c in cells {
+            assert_eq!(keys(c), ["cell", "sheet"], "addresses only");
+            let (sheet, cell) = (c["sheet"].as_str().unwrap(), c["cell"].as_str().unwrap());
+            assert!(!sheet.is_empty() && sheet.encode_utf16().count() <= MAX_SHEET_CHARS, "{sheet}");
+            let (letters, digits) = cell.split_at(cell.find(|c: char| c.is_ascii_digit()).unwrap());
+            assert!((1..=3).contains(&letters.len()) && letters.bytes().all(|b| b.is_ascii_uppercase()), "{cell}");
+            assert!(!digits.starts_with('0') && (1..=7).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit()), "{cell}");
+            out.push((sheet.to_string(), cell.to_string()));
+        }
+        out
+    }
+    fn k(sheet: &str, cell: &str) -> CellKey {
+        (sheet.into(), cell.into())
+    }
+    /// The addresses of every `draft` among the effects.
+    fn drafts_posted(effects: &[Effect]) -> Vec<Vec<(String, String)>> {
+        posted(effects).iter().filter(|m| m["type"] == "draft").map(host_accepts_draft).collect()
+    }
+
+    #[test]
+    fn a_draft_names_addresses_only_in_the_host_shape() {
+        let mut s = live(2);
+        let e = s.drafts([k("Sheet1", "B5")]);
+        assert_eq!(posted(&e), [json!({"type": "draft", "protocol": 1, "cells": [{"sheet": "Sheet1", "cell": "B5"}]})]);
+        assert_eq!(drafts_posted(&e), [vec![k("Sheet1", "B5")]]);
+    }
+
+    #[test]
+    fn no_draft_before_the_snapshot_loaded() {
+        let mut s = Sync::new();
+        assert!(s.drafts([k("Sheet1", "A1")]).is_empty(), "no port traffic before the handshake");
+        // The snapshot arrived but is not the document yet.
+        let _ = s.on_host(HostMsg::Snapshot { rev: 1, snapshot: json!({}), discarded: vec![] });
+        assert!(s.drafts([k("Sheet1", "A1")]).is_empty());
+        s.loaded(1, BTreeMap::new());
+        // Once live, the editor that is still open is reported.
+        assert_eq!(drafts_posted(&s.drafts([k("Sheet1", "A1")])), [vec![k("Sheet1", "A1")]]);
+        // Nothing open after the handshake: the host already assumes none, so nothing is sent.
+        let mut t = live(1);
+        assert!(t.drafts([]).is_empty());
+    }
+
+    #[test]
+    fn a_draft_is_sent_only_when_the_set_changes() {
+        let mut s = live(2);
+        // Start editing B5: reported once; every further frame while typing sends nothing.
+        assert_eq!(drafts_posted(&s.drafts([k("Sheet1", "B5")])), [vec![k("Sheet1", "B5")]]);
+        for _ in 0..5 {
+            assert!(s.drafts([k("Sheet1", "B5")]).is_empty());
+        }
+        // Commit (or cancel): the empty set, once.
+        assert_eq!(drafts_posted(&s.drafts([])), [Vec::<CellKey>::new()]);
+        assert!(s.drafts([]).is_empty());
+        // The selection leaves B5 for an edit of C7: the new set replaces the old one.
+        assert_eq!(drafts_posted(&s.drafts([k("Sheet1", "B5")])), [vec![k("Sheet1", "B5")]]);
+        assert_eq!(drafts_posted(&s.drafts([k("Notes", "C7")])), [vec![k("Notes", "C7")]]);
+        // The same address on another sheet is another cell.
+        assert_eq!(drafts_posted(&s.drafts([k("Sheet1", "C7")])), [vec![k("Sheet1", "C7")]]);
+    }
+
+    #[test]
+    fn a_draft_is_deduplicated_ordered_and_bounded() {
+        let mut s = live(2);
+        let e = s.drafts([k("Sheet1", "B5"), k("Notes", "A1"), k("Sheet1", "B5"), k("Notes", "A1")]);
+        assert_eq!(drafts_posted(&e), [vec![k("Notes", "A1"), k("Sheet1", "B5")]]);
+        // The same set in another order or with repeats is no change.
+        assert!(s.drafts([k("Sheet1", "B5"), k("Notes", "A1"), k("Notes", "A1")]).is_empty());
+        // Never more cells than the host takes; the longest sheet names still fit one message.
+        let long = "\u{10348}".repeat(MAX_SHEET_CHARS / 2);
+        let many: Vec<CellKey> = (1..=200).map(|r| k(&long, &format!("XFD{r}"))).collect();
+        let sent = drafts_posted(&s.drafts(many.clone()));
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].len(), MAX_OPS);
+        assert!(s.drafts(many).is_empty());
+    }
+
+    #[test]
+    fn a_draft_leaves_out_addresses_the_host_would_refuse() {
+        let mut s = live(2);
+        let e = s.drafts([
+            k("", "A1"),
+            k(&"x".repeat(MAX_SHEET_CHARS + 1), "A1"),
+            // 65 UTF-16 units twice over: 130 > 128 although only 65 chars.
+            k(&"\u{10348}".repeat(65), "A1"),
+            k("Sheet1", "a1"),
+            k("Sheet1", "A0"),
+            k("Sheet1", "AAAA1"),
+            k("Sheet1", "A12345678"),
+            k("Sheet1", "B2"),
+        ]);
+        assert_eq!(drafts_posted(&e), [vec![k("Sheet1", "B2")]]);
+        // Only refusable addresses: as good as none.
+        assert_eq!(drafts_posted(&s.drafts([k("", "A1")])), [Vec::<CellKey>::new()]);
+    }
+
+    #[test]
+    fn a_new_snapshot_keeps_what_the_host_heard() {
+        let mut s = live(2);
+        assert_eq!(drafts_posted(&s.drafts([k("Sheet1", "B5")])).len(), 1);
+        let _ = s.on_host(HostMsg::Snapshot { rev: 5, snapshot: json!({}), discarded: vec![] });
+        s.loaded(5, BTreeMap::new());
+        // The host's draft set lives with the session, not the snapshot.
+        assert!(s.drafts([k("Sheet1", "B5")]).is_empty());
+        assert_eq!(drafts_posted(&s.drafts([])).len(), 1);
     }
 
     #[test]
