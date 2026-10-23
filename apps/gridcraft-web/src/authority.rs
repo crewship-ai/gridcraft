@@ -39,21 +39,31 @@ use std::rc::Rc;
 use gridcraft_ui_egui::SheetApp;
 use serde_json::{Value as Json, json};
 use wasm_bindgen::JsCast as _;
-use wasm_bindgen::JsValue;
 use wasm_bindgen::closure::Closure;
+use wasm_bindgen::{JsValue, prelude::wasm_bindgen};
 
 use crate::document;
 use crate::protocol::{self, Status, Sync};
 
+#[wasm_bindgen(module = "/mooring/native-sdk.js")]
+extern "C" {
+    #[wasm_bindgen(catch, js_name = connectGridCraft)]
+    fn connect_gridcraft(parent_origin: &str, bundle: &str, message: &js_sys::Function, status: &js_sys::Function) -> Result<JsValue, JsValue>;
+}
+
 #[derive(Default)]
 struct Shared {
-    port: Option<web_sys::MessagePort>,
+    client: Option<JsValue>,
+    status: Option<Status>,
     inbound: VecDeque<String>,
+}
+
+fn call(client: &JsValue, method: &str, args: &js_sys::Array) -> Result<JsValue, JsValue> {
+    js_sys::Reflect::get(client, &method.into())?.dyn_into::<js_sys::Function>()?.apply(client, args)
 }
 
 pub struct Authority {
     window: web_sys::Window,
-    parent: web_sys::Window,
     parent_origin: String,
     debug: bool,
     shared: Rc<RefCell<Shared>>,
@@ -70,82 +80,75 @@ impl Authority {
             return None;
         }
         let injected = js_sys::Reflect::get(&window, &"__gridcraftDebug".into()).ok().and_then(|v| v.as_bool()) == Some(true);
-        Some(Self { window, parent, parent_origin, debug: debug || injected, shared: Rc::default(), sync: Sync::new(), last_debug: String::new() })
+        Some(Self { window, parent_origin, debug: debug || injected, shared: Rc::default(), sync: Sync::new(), last_debug: String::new() })
     }
 
-    /// Listen for the host's `gridcraft:connect` (with a `MessagePort`), then say hello once the
-    /// window has loaded.
+    /// The shared TS editor SDK owns the validated capability channel. Rust
+    /// retains native cell reconciliation, pending writes, drafts and undo.
     pub fn connect(&self, ctx: egui::Context) {
-        let parent = self.parent.clone();
-        let origin = self.parent_origin.clone();
-        let shared = self.shared.clone();
-        let on_window_message = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |event: web_sys::MessageEvent| {
-            // Explicit origin and source checks: only the expected parent may hand us a port.
-            if event.origin() != origin || !event.source().is_some_and(|s| js_sys::Object::is(&s, &parent)) {
-                return;
-            }
-            if shared.borrow().port.is_some() {
-                return; // one connection per editor instance
-            }
-            let data = js_sys::JSON::stringify(&event.data()).ok().and_then(|s| s.as_string()).and_then(|s| serde_json::from_str::<Json>(&s).ok());
-            if !data.as_ref().is_some_and(protocol::is_connect) {
-                if data.as_ref().and_then(|d| d.get("type")).and_then(Json::as_str) == Some("gridcraft:connect") {
-                    log::error!("the host speaks another bridge protocol than {}: not connecting", protocol::PROTOCOL);
-                }
-                return;
-            }
-            let Some(port) = event.ports().get(0).dyn_into::<web_sys::MessagePort>().ok() else { return };
-            let inbox = shared.clone();
-            let ctx2 = ctx.clone();
-            let on_port_message = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |e: web_sys::MessageEvent| {
-                if let Some(text) = e.data().as_string() {
-                    inbox.borrow_mut().inbound.push_back(text);
-                    ctx2.request_repaint();
-                }
-            });
-            port.set_onmessage(Some(on_port_message.as_ref().unchecked_ref()));
-            on_port_message.forget();
-            port.start();
-            shared.borrow_mut().port = Some(port);
-            ctx.request_repaint();
+        let inbox = self.shared.clone();
+        let repaint = ctx.clone();
+        let message = Closure::<dyn FnMut(String)>::new(move |raw| {
+            inbox.borrow_mut().inbound.push_back(raw);
+            repaint.request_repaint();
         });
-        if self.window.add_event_listener_with_callback("message", on_window_message.as_ref().unchecked_ref()).is_ok() {
-            on_window_message.forget();
-        }
-
+        let state = self.shared.clone();
+        let status = Closure::<dyn FnMut(String, String)>::new(move |value: String, reason: String| {
+            let next = match value.as_str() {
+                "saved" => Status::Saved,
+                "saving" => Status::Saving,
+                "offline" => Status::Offline,
+                "draft" | "error" => Status::NotSaved(reason),
+                _ => Status::Connecting,
+            };
+            let mut state = state.borrow_mut();
+            if state.status.as_ref() != Some(&next) {
+                state.status = Some(next);
+                ctx.request_repaint();
+            }
+        });
         let bundle = self.window.location().pathname().ok().and_then(|p| protocol::bundle_digest_from_path(&p));
-        if bundle.is_none() {
-            log::warn!("not served from a pinned bundle path (…/b/<digest>/index.html): the hello names no bundle");
-        }
-        let hello = protocol::hello(bundle.as_deref()).to_string();
-        let parent = self.parent.clone();
-        let origin = self.parent_origin.clone();
-        // Always in a task of its own, after the one that fired `load`.
-        let say_hello = Closure::once_into_js(move || {
-            let msg = js_sys::JSON::parse(&hello).unwrap_or(JsValue::NULL);
-            if let Err(e) = parent.post_message(&msg, &origin) {
-                log::error!("hello to the host failed: {e:?}");
+        let Some(bundle) = bundle else {
+            self.shared.borrow_mut().status = Some(Status::NotSaved("Editor is not served from a pinned bundle".into()));
+            return;
+        };
+        match connect_gridcraft(&self.parent_origin, &bundle, message.as_ref().unchecked_ref(), status.as_ref().unchecked_ref()) {
+            Ok(client) => {
+                self.shared.borrow_mut().client = Some(client);
+                message.forget();
+                status.forget();
             }
-        });
-        let complete = self.window.document().is_some_and(|d| d.ready_state() == "complete");
-        if complete {
-            let _ = self.window.set_timeout_with_callback_and_timeout_and_arguments_0(say_hello.unchecked_ref(), 0);
-        } else {
-            let window = self.window.clone();
-            let on_load = Closure::once_into_js(move || {
-                let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(say_hello.unchecked_ref(), 0);
-            });
-            let options = web_sys::AddEventListenerOptions::new();
-            options.set_once(true);
-            let _ = self.window.add_event_listener_with_callback_and_add_event_listener_options("load", on_load.unchecked_ref(), &options);
+            Err(error) => {
+                log::error!("editor SDK startup failed: {error:?}");
+                self.shared.borrow_mut().status = Some(Status::NotSaved("Editor connection could not start".into()));
+            }
         }
     }
 
     fn post(&self, msg: &Json) {
-        if let Some(port) = &self.shared.borrow().port
-            && let Err(e) = port.post_message(&JsValue::from_str(&msg.to_string()))
-        {
-            log::error!("post to the host failed: {e:?}");
+        let client = self.shared.borrow().client.clone();
+        if let Some(client) = client {
+            let args = js_sys::Array::of1(&JsValue::from_str(&msg.to_string()));
+            if let Err(error) = call(&client, "send", &args) {
+                log::error!("editor SDK send failed: {error:?}");
+            }
+        }
+    }
+
+    fn report_status(&self, status: &Status) {
+        let client = self.shared.borrow().client.clone();
+        if let Some(client) = client {
+            let (value, reason) = match status {
+                Status::Connecting => ("connecting", ""),
+                Status::Saved => ("saved", ""),
+                Status::Saving => ("saving", ""),
+                Status::Offline => ("offline", ""),
+                Status::NotSaved(reason) => ("error", reason.as_str()),
+            };
+            let args = js_sys::Array::of3(&value.into(), &JsValue::from_f64(self.sync.confirmed_rev as f64), &reason.into());
+            if let Err(error) = call(&client, "reportStatus", &args) {
+                log::error!("editor SDK status failed: {error:?}");
+            }
         }
     }
 
@@ -155,7 +158,8 @@ impl Authority {
         for msg in document::step(&mut self.sync, app, inbound) {
             self.post(&msg);
         }
-        let status = self.sync.status();
+        self.report_status(&self.sync.status());
+        let status = self.shared.borrow().status.clone().unwrap_or(Status::Connecting);
         self.draw_status(ctx, &status);
         if self.debug {
             self.write_debug(app, &status);

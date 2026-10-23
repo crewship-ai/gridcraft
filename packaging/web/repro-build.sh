@@ -48,6 +48,7 @@ mkdir -p "$CARGO_TARGET_DIR"
 CARGO_TARGET_DIR="$(cd "$CARGO_TARGET_DIR" && pwd)"
 
 cd "$ROOT"
+python3 "$HERE/verify-sdk.py"
 REV="$(git rev-parse HEAD)"
 DIRTY=false
 [ -z "$(git status --porcelain --untracked-files=no)" ] || DIRTY=true

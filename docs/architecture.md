@@ -1,6 +1,6 @@
 # Architecture
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-10 · **Change:** major (created from the code on main; supersedes the local-only plan/architecture.md for committed docs) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-23 · **Change:** major (created from the code on main; supersedes the local-only plan/architecture.md for committed docs) · **Target:** Microsoft Excel (Microsoft 365)
 
 How GridCraft is built today. Rules for contributors are in [`AGENTS.md`](../AGENTS.md).
 
@@ -64,8 +64,20 @@ rpm, tarball), FreeBSD, and web (WASM; WebGPU or WebGL2). Release workflows in
 - XLSX reader builds the whole workbook in memory; no streaming (#175).
 - Unmodelled XLSX parts are not carried through a save.
 
+## Embedded Mooring client (2026-10-23)
+
+The browser authority adapter uses the same canonical TypeScript editor client
+as Mooring's JSON reference editor. The client is vendored with source and
+compiler/hash provenance in `apps/gridcraft-web/mooring`; wasm-bindgen packages
+its generated local ES module. This deliberately small browser boundary owns
+handshake, version, capability-port validation and transport lifecycle. Rust
+retains the native document, receipt, draft and undo state machine. Unsupported
+host mutations remain blocked by `engine::host_policy`; the SDK does not widen
+the supported spreadsheet feature surface.
+
 ## Revision history
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-23 | minor | Shared editor-side Mooring SDK with native cell reconciliation retained |
 | 2026-10-10 | major | Created from the code on main: crates, layers, data flow, agent control, known gaps |

@@ -1,0 +1,14 @@
+{
+  "repository": "https://github.com/crewship-ai/crewship",
+  "commit": "db77a60dd97c02c388c26a72b34325d623c4982c",
+  "esbuild": "0.28.2",
+  "sources": {
+    "channel.ts": "3edd0c794ad677aae2670068426c4f4ef4cbd80b82aa0dbd986f703919bb226b",
+    "editor-connection.ts": "bc890e2f9b4ab73684e7371b09bd06ebdfacb0372397ba9a04b5c4ce47354085",
+    "editor-sdk.ts": "dcab629900294a5541d39bd5fbc88968553aa5fc3061daf4cf251c81936ca8a2",
+    "native-profile.ts": "dd30d5f4fd7b324bf40eca40ff682c9ae72357737578e91ce4db3c66b28bc8e3",
+    "gridcraft-native.ts": "1eedf593402b97e40f59174bfaf4129bee8f94eeaae8a68212b7c3d206c1c331"
+  },
+  "compiled_sha256": "e92ec6877457cd8a64e7424d1ab1fb7d9d1f9b7032dc18e3adb862f5e04dfe79",
+  "build": "esbuild src/gridcraft-native.ts --bundle --format=esm --platform=browser --target=es2022 --minify --legal-comments=none --outfile=native-sdk.js"
+}

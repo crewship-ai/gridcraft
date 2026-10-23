@@ -68,11 +68,13 @@ pub fn bundle_digest_from_path(path: &str) -> Option<String> {
     (*b == "b" && hex && (*file == "index.html" || file.is_empty()) && prefix.iter().all(plain)).then(|| digest.to_string())
 }
 
+#[cfg(test)]
 pub fn hello(bundle: Option<&str>) -> Json {
     json!({"type": "gridcraft:hello", "protocol": PROTOCOL, "bundle": bundle})
 }
 
 /// A window message that hands over the port: `gridcraft:connect`, protocol 1.
+#[cfg(test)]
 pub fn is_connect(data: &Json) -> bool {
     data.get("type").and_then(Json::as_str) == Some("gridcraft:connect") && data.get("protocol").and_then(Json::as_u64) == Some(PROTOCOL)
 }
