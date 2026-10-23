@@ -285,7 +285,13 @@ impl Sync {
         if !self.online {
             return Status::Offline;
         }
-        if self.pending.is_empty() { Status::Saved } else { Status::Saving }
+        if !self.pending.is_empty() {
+            Status::Saving
+        } else if !self.drafts_sent.is_empty() {
+            Status::NotSaved("finish editing the cell".into())
+        } else {
+            Status::Saved
+        }
     }
 
     /// The cell the user is editing now (each frame).
@@ -646,6 +652,15 @@ mod tests {
     /// The addresses of every `draft` among the effects.
     fn drafts_posted(effects: &[Effect]) -> Vec<Vec<(String, String)>> {
         posted(effects).iter().filter(|m| m["type"] == "draft").map(host_accepts_draft).collect()
+    }
+
+    #[test]
+    fn an_open_draft_is_not_saved_before_it_is_submitted() {
+        let mut s = live(2);
+        s.drafts([k("Sheet1", "B5")]);
+        assert_eq!(s.status(), Status::NotSaved("finish editing the cell".into()));
+        s.drafts([]);
+        assert_eq!(s.status(), Status::Saved);
     }
 
     #[test]
