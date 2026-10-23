@@ -8,9 +8,10 @@
 //! Handshake (window messages):
 //! - editor → parent, to `parent_origin` only, from the window's `load` event or later:
 //!   `{type:"gridcraft:hello", protocol:1, bundle}`. `bundle` is the digest of the bundle this
-//!   page was served from, taken from its own URL (`/b/<sha256 of the bundle manifest>/…`); the
-//!   host compares it with the bundle it framed. It is `null` when the page wasn't served from a
-//!   pinned bundle path (and a host then refuses the editor).
+//!   page was served from, taken from its own URL (`…/b/<sha256 of the bundle manifest>/…`,
+//!   below any prefix of whole path segments such as same-host `/_editor`); the host compares it
+//!   with the bundle it framed. It is `null` when the page wasn't served from a pinned bundle
+//!   path (and a host then refuses the editor).
 //! - parent → editor: `{type:"gridcraft:connect", protocol:1, …}` with a `MessagePort`.
 //!
 //! On the port, every message is a JSON string with `protocol: 1`:
@@ -47,12 +48,20 @@ pub fn key(op: &RemoteOp) -> CellKey {
     (op.sheet.clone(), op.cell.a1())
 }
 
-/// The bundle digest in a page path `/b/<64 lowercase hex>/index.html`.
+/// The bundle digest in a page path that ends in `b/<64 lowercase hex>/index.html` (or
+/// `b/<digest>/`). A host may serve the bundle below a prefix of whole path segments, e.g.
+/// same-host `/_editor/b/<digest>/index.html` or a dedicated origin's `/b/<digest>/index.html`.
+///
+/// The path is the raw (still percent-encoded) `location.pathname`. Anything that is not plainly
+/// such a path gives `None`: no query or fragment, no empty, `.` or `..` segment (so no `//`), and
+/// prefix segments only of unreserved characters (`A-Z a-z 0-9 - . _ ~`), so no `%`-encoded or
+/// foreign separators.
 pub fn bundle_digest_from_path(path: &str) -> Option<String> {
-    let rest = path.strip_prefix("/b/")?;
-    let (digest, file) = rest.split_once('/')?;
-    let hex = digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-    (hex && file == "index.html").then(|| digest.to_string())
+    let segments: Vec<&str> = path.strip_prefix('/')?.split('/').collect();
+    let [prefix @ .., b, digest, file] = segments.as_slice() else { return None };
+    let hex = digest.len() == 64 && digest.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c));
+    let plain = |s: &&str| !s.is_empty() && *s != "." && *s != ".." && s.bytes().all(|c| c.is_ascii_alphanumeric() || b"-._~".contains(&c));
+    (*b == "b" && hex && (*file == "index.html" || file.is_empty()) && prefix.iter().all(plain)).then(|| digest.to_string())
 }
 
 pub fn hello(bundle: Option<&str>) -> Json {
@@ -476,13 +485,75 @@ mod tests {
     fn bundle_digest_comes_only_from_a_pinned_bundle_path() {
         let d = "ab".repeat(32);
         assert_eq!(bundle_digest_from_path(&format!("/b/{d}/index.html")), Some(d.clone()));
+        assert_eq!(bundle_digest_from_path(&format!("/b/{d}/")), Some(d.clone()));
         for bad in [
             format!("/b/{}/index.html", "AB".repeat(32)),
             format!("/b/{}/index.html", "ab".repeat(31)),
+            format!("/b/{}/index.html", "ab".repeat(33)),
+            format!("/b/{}g/index.html", "ab".repeat(31)),
             format!("/b/{d}/other.html"),
-            format!("/x/b/{d}/index.html"),
             format!("/b/{d}/sub/index.html"),
+            format!("/b/{d}/index.html/"),
+            format!("/b/{d}"),
+            format!("b/{d}/index.html"),
+            format!("/B/{d}/index.html"),
             "/index.html".to_string(),
+            String::new(),
+        ] {
+            assert_eq!(bundle_digest_from_path(&bad), None, "{bad}");
+        }
+    }
+
+    /// A host may serve the bundle below a prefix of whole path segments, e.g. same-host
+    /// `/_editor/b/<digest>/index.html`.
+    #[test]
+    fn bundle_digest_is_taken_below_a_prefix_of_whole_segments() {
+        let d = "0123456789abcdef".repeat(4);
+        for good in [
+            format!("/_editor/b/{d}/index.html"),
+            format!("/_editor/b/{d}/"),
+            format!("/x/b/{d}/index.html"),
+            format!("/a/b-c/v1.2_~x/b/{d}/index.html"),
+        ] {
+            assert_eq!(bundle_digest_from_path(&good), Some(d.clone()), "{good}");
+        }
+        for bad in [
+            // not lowercase / not 64 hex / not exactly `b/<digest>/index.html` at the end
+            format!("/_editor/b/{}/index.html", d.to_uppercase()),
+            format!("/_editor/b/{}/index.html", &d[..63]),
+            format!("/_editor/b/{d}0/index.html"),
+            format!("/_editor/b/{d}/index.html/x"),
+            format!("/_editor/b/{d}/x/index.html"),
+            format!("/_editor/b/{d}/index.htm"),
+            format!("/_editor/xb/{d}/index.html"),
+            format!("/_editor/{d}/index.html"),
+            // dot segments, empty segments, authority-looking paths
+            format!("/../b/{d}/index.html"),
+            format!("/_editor/../b/{d}/index.html"),
+            format!("/_editor/./b/{d}/index.html"),
+            format!("/_editor//b/{d}/index.html"),
+            format!("//b/{d}/index.html"),
+            format!("//evil.example/b/{d}/index.html"),
+            format!("/b//{d}/index.html"),
+            format!("/_editor/b/{d}//index.html"),
+            // encoded or foreign separators
+            format!("/_editor%2Fb/{d}/index.html"),
+            format!("/x%2F/b/{d}/index.html"),
+            format!("/x%2f..%2f/b/{d}/index.html"),
+            format!("/_editor/b%2F{d}/index.html"),
+            format!("/_editor/b/{d}%2Findex.html"),
+            format!("/x\\y/b/{d}/index.html"),
+            format!("/_editor\\b/{d}/index.html"),
+            format!("/x;y/b/{d}/index.html"),
+            // query and fragment never belong to a path
+            format!("/_editor/b/{d}/index.html?x=1"),
+            format!("/_editor/b/{d}/index.html#x"),
+            format!("/x?/b/{d}/index.html"),
+            format!("/x#/b/{d}/index.html"),
+            format!("/_editor/b/{d}/?"),
+            // relative or absolute URLs instead of a path
+            format!("_editor/b/{d}/index.html"),
+            format!("https://evil.example/b/{d}/index.html"),
         ] {
             assert_eq!(bundle_digest_from_path(&bad), None, "{bad}");
         }

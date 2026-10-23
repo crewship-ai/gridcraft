@@ -110,7 +110,7 @@ impl Authority {
 
         let bundle = self.window.location().pathname().ok().and_then(|p| protocol::bundle_digest_from_path(&p));
         if bundle.is_none() {
-            log::warn!("not served from a pinned bundle path (/b/<digest>/index.html): the hello names no bundle");
+            log::warn!("not served from a pinned bundle path (…/b/<digest>/index.html): the hello names no bundle");
         }
         let hello = protocol::hello(bundle.as_deref()).to_string();
         let parent = self.parent.clone();

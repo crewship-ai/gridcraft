@@ -105,7 +105,9 @@ The format is strict (exactly these keys, clean relative paths, lowercase hex di
 `packaging/web/bundle-manifest.py check <dir>`). The **bundle digest** is the sha256 of the
 manifest's exact bytes (`<out_dir>/bundle-digest.txt`). `<out_dir>/bundle/<digest>/` (also as
 `gridcraft-web-bundle.tar`) is the served layout: the files plus `manifest.json`, meant to be
-served at `/b/<digest>/`.
+served at `/b/<digest>/`, optionally below a prefix of whole path segments (Crewship's same-host
+mode serves `/_editor/b/<digest>/`). The editor names the bundle in its hello only when its own
+path ends exactly in `b/<digest>/index.html` (or `b/<digest>/`).
 
 `.github/workflows/web-repro.yml` builds twice on two runners, requires identical output, checks
 the manifest and uploads the bundle as the `gridcraft-web-bundle-<digest>` artifact; the digest
