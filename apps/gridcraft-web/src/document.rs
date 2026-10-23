@@ -639,4 +639,72 @@ mod tests {
         assert_eq!(e.input("B3"), "1", "the unconfirmed edit stays");
         assert_eq!(e.undo_len(), 0);
     }
+    #[test]
+    fn review_old_ack_after_snapshot_must_keep_latest_remote_value() {
+        let mut e = Editor::new();
+        e.host(snapshot(1, &[("B3", "initial")], &[]));
+        e.set("B3", "mine");
+        e.host(snapshot(4, &[("B3", "theirs-later")], &[]));
+        e.host(json!({"type":"ack", "protocol":1, "seq":1, "rev":3}));
+        assert_eq!(e.sync.status(), Status::Saved);
+        assert_eq!(e.input("B3"), "theirs-later", "ack of included old write must expose newer snapshot value");
+    }
+
+    #[test]
+    fn old_ack_keeps_newer_pending_and_open_draft_after_snapshot() {
+        let mut e = Editor::new();
+        e.host(snapshot(1, &[("B3", "initial")], &[]));
+        e.set("B3", "first");
+        e.set("B3", "second");
+        e.select("B3");
+        e.type_text("still typing");
+        e.host(snapshot(4, &[("B3", "theirs-later")], &[]));
+        let draft = e.editor();
+        e.host(json!({"type":"ack", "protocol":1, "seq":1, "rev":3}));
+        assert_eq!(e.input("B3"), "second");
+        assert_eq!(e.editor(), draft);
+        assert_eq!(e.sync.status(), Status::Saving);
+        e.host(json!({"type":"ack", "protocol":1, "seq":2, "rev":4}));
+        assert_eq!(e.input("B3"), "theirs-later");
+        assert_eq!(e.editor(), draft);
+    }
+
+    #[test]
+    fn old_ack_reconciles_every_cell_in_a_batch() {
+        let mut e = Editor::new();
+        e.host(snapshot(1, &[("A1", "1")], &[]));
+        e.app.session.run("selection.set", json!({"range": "A1:A4"})).unwrap();
+        e.frames(1);
+        e.app.session.run("edit.fillDown", json!({})).unwrap();
+        e.frames(2);
+        e.host(snapshot(4, &[("A1", "1"), ("A2", "2"), ("A3", "3"), ("A4", "4")], &[]));
+        e.host(json!({"type":"ack", "protocol":1, "seq":1, "rev":3}));
+        assert_eq!((e.input("A2"), e.input("A3"), e.input("A4")), ("2".into(), "3".into(), "4".into()));
+        assert_eq!(e.sync.status(), Status::Saved);
+    }
+    #[test]
+    fn review_equal_ack_does_not_make_own_edit_impossible_to_undo() {
+        let mut e = Editor::new();
+        e.host(snapshot(1, &[("B3", "initial")], &[]));
+        e.set("B3", "mine");
+        e.host(snapshot(2, &[("B3", "mine")], &[]));
+        e.host(json!({"type":"ack", "protocol":1, "seq":1, "rev":2}));
+        assert_eq!(e.sync.status(), Status::Saved);
+        e.app.session.run("edit.undo", json!({})).unwrap();
+        e.frames(2);
+        assert_eq!(e.input("B3"), "initial", "undo own acknowledged edit should work");
+    }
+    #[test]
+    fn review_old_ack_undo_does_not_overwrite_remote_snapshot_value() {
+        let mut e = Editor::new();
+        e.host(snapshot(1, &[("B3", "initial")], &[]));
+        e.set("B3", "mine");
+        e.host(snapshot(4, &[("B3", "theirs-later")], &[]));
+        e.host(json!({"type":"ack", "protocol":1, "seq":1, "rev":3}));
+        let n = e.posted.len();
+        e.app.session.run("edit.undo", json!({})).unwrap();
+        e.frames(2);
+        assert_eq!(e.input("B3"), "theirs-later");
+        assert!(of_type(&e.since(n), "mutation").is_empty());
+    }
 }

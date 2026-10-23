@@ -437,6 +437,19 @@ impl Sync {
             HostMsg::Ack { seq, rev } => {
                 let Some(i) = self.pending.iter().position(|p| p.seq == seq) else { return vec![] };
                 let p = self.pending.remove(i);
+                // A snapshot or commit feed already includes this receipt. Its current values
+                // may be newer than our write: remove only this pending overlay, never roll the
+                // confirmed document back to the input that was saved at the older revision.
+                if rev <= self.confirmed_rev {
+                    let still = self.pending_cells();
+                    let ops = p
+                        .ops
+                        .iter()
+                        .filter(|op| !still.contains(&key(op)) && self.confirmed.get(&key(op)).map(String::as_str).unwrap_or_default() != op.input)
+                        .map(|op| RemoteOp { input: self.confirmed.get(&key(op)).cloned().unwrap_or_default(), ..op.clone() })
+                        .collect::<Vec<_>>();
+                    return if ops.is_empty() { vec![] } else { vec![Effect::Apply { rev: self.confirmed_rev, ops }] };
+                }
                 for op in &p.ops {
                     self.touch(&key(op));
                     self.confirmed.insert(key(op), op.input.clone());
